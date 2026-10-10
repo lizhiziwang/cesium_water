@@ -2,6 +2,10 @@
 *.motionA.png
 *.motionB.png
 
+# 探针默认输出（README 引用的截图在 screenshots/，用 --out 指定）
+/shot.png
+/under.png
+
 # 依赖 / 编辑器 / 系统
 node_modules/
 .vscode/
