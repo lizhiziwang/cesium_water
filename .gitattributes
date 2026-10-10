@@ -1,0 +1,6 @@
+# 归一化文本换行；二进制文件不做任何处理
+* text=auto
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.glb binary

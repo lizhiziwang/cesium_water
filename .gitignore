@@ -1,0 +1,10 @@
+# 探针运行产物（motion-check 会写 *.motionA.png / *.motionB.png）
+*.motionA.png
+*.motionB.png
+
+# 依赖 / 编辑器 / 系统
+node_modules/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
