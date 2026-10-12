@@ -1618,8 +1618,13 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       // ---- 物理大气下的水面合成控制（详见着色器 §5 / §9.5 注释）----
       // 低太阳高度角时物理天空的地平线本身就是暖白（B-R≈-0.05），全强度反射 +
       // 全强度气透视会让中远景水面变成灰白板（用户实测反馈）。
-      uAtmoReflGain:      0.75,      // 物理天空反射强度（1 = 完全按物理，<1 压暗并露回水色）
-      uAtmoReflTint:      0.75,      // 地平线附近反射色相校正（向 uHorizonColor 靠，1 = 全用 uHorizonColor）
+      // 【v21 用户实测定稿】"蓝的亮度太高、不真实" —— 上一版为了消灰白把反射拉回浅蓝，
+      // 结果中远景成了偏亮的青蓝（实测 y[0.50,0.63] (0.490,0.608,0.679) L0.588）。
+      // 真实深海在低太阳下应该【明显比天空暗】且偏深蓝：gain 0.75→0.45、tint 0.75→0.60。
+      // 实测整片水面 y[0.38,1] 平均 L 0.531→0.454，蓝度(B-R) 0.112→0.084（更沉、不发青白）。
+      // 往回调大即更接近物理/更亮；面板「物理大气·水面合成」组可实时调。
+      uAtmoReflGain:      0.45,      // 物理天空反射强度（1 = 完全按物理，<1 压暗并露回水色）
+      uAtmoReflTint:      0.60,      // 地平线附近反射色相校正（向 uHorizonColor 靠，1 = 全用 uHorizonColor）
       uAtmoApScale:       0.45,      // 气透视强度（1 = 标准 color·T+S，0 = 关闭）
       uSunColor:          '#fff2d8',
       uSunDiscCos:        0.99960,
@@ -1686,8 +1691,8 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       // 0.55 配合（已提亮的）farSea 仍偏暗；降到 0.35 消暗斑驳，湖面更均匀。
       uBelowHorizonDark:  0.35,
       // ---- 物理大气下的水面合成控制（海洋同步；湖面体色更亮，反射压得稍轻）----
-      uAtmoReflGain:      0.78,
-      uAtmoReflTint:      0.70,
+      uAtmoReflGain:      0.50,
+      uAtmoReflTint:      0.55,
       uAtmoApScale:       0.45,
       uSunColor:          '#fff6e2',
       uSunDiscCos:        0.99960,

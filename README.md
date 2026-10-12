@@ -93,8 +93,8 @@ underwater.setUnderwater(true);           // 入水（setUnderwater(false) 出�
 | `uAlpha` | 整体通透度 |
 | `uEdgeFade` | 面片边缘羽化，让水面溶进下方真实影像 |
 | `uAtmoExposure` | 物理大气曝光（天穹 + 水面反射 + 气透视同步生效） |
-| `uAtmoReflGain` | **物理天空反射强度**（1 = 完全按物理；<1 压暗，让水色透出来） |
-| `uAtmoReflTint` | **地平线反射色相校正**（向 `uHorizonColor` 靠，1 = 完全用它） |
+| `uAtmoReflGain` | **物理天空反射强度**（1 = 完全按物理；<1 压暗，让水色透出来。海洋默认 0.45） |
+| `uAtmoReflTint` | **地平线反射色相校正**（向 `uHorizonColor` 靠，1 = 完全用它。海洋默认 0.60） |
 | `uAtmoApScale` | **气透视强度**（1 = 标准 `color·T+S`，0 = 关闭） |
 
 后三项只影响**水面**（天穹不读），默认值已按"低太阳 + 掠射"调好。物理大气在低太阳
@@ -167,6 +167,7 @@ Cesium（WebGL / 前向渲染 / 单 Pass 模型）拿不到屏幕深度与场景
 | 卡在「检查运行环境」 | 浏览器不支持 WebGL2：换新版 Chrome / Edge，检查 `chrome://gpu` |
 | 着色器编译报错（顶部红条） | 看控制台 `[step ✘]` 行；先跑 `node _verify_glb.cjs` 静态排查 |
 | 天空全黑 / 天穹被雾盖住 | 确认未手动改 `scene.fog`；天穹依赖"包围球跟随相机"避开模型雾（createAtmosphere 内部处理） |
-| 中远景水面成片**灰白**（低太阳 + 掠射） | 物理天空的地平线本身是暖白、且气透视比旧解析雾强 20~50 倍。调 `uAtmoReflTint`（↑ 更蓝）、`uAtmoReflGain`（↓ 更暗更透水色）、`uAtmoApScale`（↓ 雾更薄）；三项都设 1 即完全按物理 |
+| 中远景水面成片**灰白**（低太阳 + 掠射） | 物理天空的地平线本身是暖白、且气透视比旧解析雾强 20~50 倍。调 `uAtmoReflTint`（↑ 更蓝）、`uAtmoReflGain`（↑ 反射更强）、`uAtmoApScale`（↓ 雾更薄）；三项都设 1 即完全按物理 |
+| 水面**偏亮/蓝得发青**，不像真实海 | 反射太强。把 `uAtmoReflGain` 往下推（0.45 是深海向默认值，1.0 = 完全按物理），`uAtmoReflTint` 降到 0.4~0.6 可去掉人工青味。真实远海总比它上方的天空明显暗一截 |
 | 背光波面发黑 | 反射方向落到地平线以下时物理积分的射线打到地面且地表辐射为 0。着色器已把反射射线钳到地平线再采样（§5），若仍见暗斑先确认 `uBelowHorizonDark` 未被调得过大 |
 | 底图不显示 | 不影响水面；Esri/OSM 瓦片服务偶尔限流，稍后重试或切底图 |
