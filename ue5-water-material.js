@@ -270,6 +270,123 @@ vec3 atmoScatterSource(float h, float cosSun, float ri, float muSun) {
   return (scat * Tsun + iso) * uAtmoSunIrradiance;
 }
 
+// ---- 程序化云层（v21：天穹与水面反射共用，水面终于"有东西可反"）----
+// 【为什么这是真实感最大的一块】真实海面的观感大半来自反射的天空【内容】：
+// 云、云隙亮边、晨昏染色。纯渐变天空反射到掠射水面上就是一片平滑色 —— 水面
+// 再怎么调都像"漆出来的"。云放共享 GLSL 里，atmoSkyRadiance 出口统一合成，
+// 天穹 / 水面反射 / 水下斯涅尔窗三处自动共享同一朵云，色调严格一致。
+// 【世界固定 + 无大数精度】云 UV 用「世界方向投影」：rdW.xz/dot(rdW,upW)，
+// 只依赖视线的世界方向 —— 相机平移/旋转云都不跟手，且没有 ECEF 6.4e6 大数的
+// float32 精度问题（rdW 是单位向量）。
+float atmoHash21(vec2 p) {
+  p = fract(p * vec2(234.34, 435.345));
+  p += dot(p, p + 34.23);
+  return fract(p.x * p.y);
+}
+float atmoNoise2(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = atmoHash21(i);
+  float b = atmoHash21(i + vec2(1.0, 0.0));
+  float c = atmoHash21(i + vec2(0.0, 1.0));
+  float d = atmoHash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+float atmoFbm(vec2 p) {
+  float v = 0.0;
+  float amp = 0.5;
+  for (int i = 0; i < 5; i++) {
+    v += amp * atmoNoise2(p);
+    p = p * 2.03 + vec2(17.3, 9.1);
+    amp *= 0.5;
+  }
+  return v;
+}
+// 返回 vec4(cloudRGB, alpha)。rdEC/sunDir 均为眼空间；up0 = 相机处径向"上"（眼空间）
+// 【v22 视差】云不再"画在无穷远"，而是 uCloudHeight 米高处的一层：
+//   · 射线-云层求交带【起点海拔】（orgW：天穹=相机位置；反射/折射近似同用相机）
+//     ⇒ 缩放升降时云场真实地收敛/发散（above = 云高-海拔 乘进投影里）；
+//   · uv 以固定地理锚点 uCloudAnchorWC 为原点 ⇒ 平移时云随地理位置滑动（真视差）；
+//   · 起点接近云层高度时整体淡出（天穹几何只能画"头顶的云"，脚下的云层不属于天穹）。
+vec4 atmoCloudLayer(vec3 rdEC, vec3 up0, vec3 sunDir, float tSec) {
+  vec3 rdW  = mat3(czm_inverseView) * rdEC;      // 眼空间 → 世界（ECEF 方向）
+  vec3 orgW = czm_inverseView[3].xyz;            // 射线起点（世界系）
+  float camAlt = length(orgW) - uAtmoBottomR;    // 起点海拔（地心半径-地面半径）
+  float above  = uCloudHeight - camAlt;          // 起点到云层的垂直距离
+  if (above < 1.0) return vec4(0.0);             // 已到云层之上：高空不再有"贴脸云"
+  // 锚点局部地平坐标系（锚点未设时退化用起点自身径向；锚点在极点时 east 未定义，不适用）
+  vec3 upA    = (length(uCloudAnchorWC) > 1.0) ? normalize(uCloudAnchorWC) : normalize(orgW);
+  vec3 eastA  = normalize(cross(vec3(0.0, 0.0, 1.0), upA));
+  vec3 northA = cross(upA, eastA);
+  float ru = dot(rdW, upA);
+  if (ru < 0.035) return vec4(0.0);              // 地平线以下 / 贴地平线：交给大气雾
+  vec3 dPerp = rdW - upA * ru;                   // 射线的水平分量
+  // uv =（起点相对锚点的水平位置 + 沿射线打到云层的水平偏移）/ 云团特征尺寸
+  //    水平偏移 = dPerp·above/ru（= above/tan(仰角)）。缩放改变 above、平移改变 rel，
+  //    两者都真实响应相机 —— 修掉 v21 "怎么缩放云都纹丝不动"（当时只是常数 3.0 的
+  //    纯方向投影，云等效在无穷远，位置/高度完全不影响云场）。
+  vec3 rel = orgW - uCloudAnchorWC;
+  vec2 uv = vec2(dot(rel, eastA) + dot(dPerp, eastA) * above / ru,
+                 dot(rel, northA) + dot(dPerp, northA) * above / ru) / uCloudScale;
+  uv += tSec * uCloudSpeed * vec2(0.72, 0.36);   // 随风漂移
+  float tDeck = above / ru;                      // 沿射线到云层的斜距（m）：掠射时穿过更厚的云
+  // 掠射 LOD：仰角越低 uv 越大，细八度会出高频闪烁 —— 把噪声坐标整体粗化。
+  // 这是让云能延伸到地平线附近的关键（不然只能用淡出杀掉半边天，天显得空）。
+  vec2 uvL = uv * mix(0.45, 1.0, smoothstep(0.05, 0.30, ru));
+  // ---------- 形状场：大尺度团块为主 + 中尺度起伏 ----------
+  // 两级尺度叠加 → 云有大小之分（单尺度 FBM = 满屏同尺寸棉花球）。
+  // atmoFbm 自身的 5 个八度（最高 17× 频率）正好当云体内部的侵蚀细节，不必再单采。
+  // fBig 权重 0.85：云要成"团"；fMid 只做边缘破碎 —— 权重一高云就碎成斑点（实测）。
+  vec2 q = uvL + 0.30 * vec2(atmoFbm(uvL * 1.9 + 3.1), atmoFbm(uvL * 1.9 + 7.7));
+  float fBig = atmoFbm(q * 1.25);
+  float fMid = atmoFbm(q * 3.10 + 11.0);
+  float cover = clamp(uCloudCover, 0.0, 1.0);
+  float thr = mix(0.86, 0.22, cover);
+  float d = (fBig * 0.85 + fMid * 0.15) - thr;
+  if (d <= 0.0) return vec4(0.0);
+  float dens = clamp(d * 2.6, 0.0, 1.0);         // 核心浓、边缘薄
+  // ---------- 光学厚度：不透明度 = 1 - exp(-密度 × 斜距) ----------
+  // 【真实感的分界】旧版用 smoothstep 出二值 alpha ⇒ 每朵云都是"实心剪纸"。
+  // 真实云是水汽：薄边半透明、核心不透明；近地平线斜距几十 km ⇒ 云连成一片厚云海。
+  float od = dens * tDeck / (uCloudScale * 4.5);
+  float alpha = 1.0 - exp(-od * mix(2.0, 5.0, clamp(uCloudSharp * 1.4, 0.0, 1.0)));
+  if (alpha <= 0.003) return vec4(0.0);
+  // ---------- 自阴影：沿太阳方向偏移再取一次中尺度密度 ----------
+  // 朝太阳那侧更薄 → 受光；更厚 → 被自身挡住。给出"亮边 + 暗身"的立体感。
+  // （只按"离太阳远近"调亮度 = 肥皂泡；云立不立体全看这一步。）
+  // sunDir 是眼空间，转到世界系后投到锚点地平坐标系（与 uv 同一坐标系，偏移才有地理意义）。
+  vec3 sunW = mat3(czm_inverseView) * sunDir;
+  vec2 sunUV = normalize(vec2(dot(sunW, eastA), dot(sunW, northA)) + vec2(1e-4, 0.0));
+  float fSun = atmoFbm((q + sunUV * 0.16) * 3.10 + 11.0);
+  float dSun = (fBig * 0.85 + fSun * 0.15) - thr;
+  // 【v23 关键教训：辐亮度必须与天空同量级，否则全是死白】
+  // 云的合成亮度 = col × 0.30 × 曝光40 = 12×col，过 Reinhard 再过 sRGB 伽马：
+  //   col 0.15 → 显示 0.82；col 1.15 → 显示 0.97 —— 旧版 [0.42,1.14] 全被压进
+  //   0.83~0.93 的"死白带"，怎么调明暗都看不见（改暗端/改阴影强度全无效，实测）。
+  // 正确量级：colDark ~0.06（显示 0.75 灰底）、colLit ~0.58（显示 0.94 亮边）。
+  float lit  = exp(-max(dSun, 0.0) * 8.0);
+  // 云底更暗：仰角越高 = 越是在看云的底面（真实积云的底几乎是平的灰蓝色）
+  float baseView = smoothstep(0.10, 0.58, ru);
+  vec3 cloudCol = mix(vec3(0.055, 0.070, 0.105), vec3(0.58, 0.56, 0.52), lit);
+  cloudCol *= mix(1.0, 0.80, baseView);
+  // 银边：薄的云边 + 视线贴近太阳 → 前向散射的亮边（量级随云色一起压小）
+  float rim = (1.0 - dens) * pow(max(dot(rdEC, sunDir), 0.0), 6.0);
+  cloudCol += vec3(0.10, 0.093, 0.080) * rim;
+  // 晨昏染色：太阳低时云被红光化（与物理大气的地平线暖色同一逻辑）
+  float sunUp = clamp(dot(up0, sunDir) * 4.0 + 0.22, 0.0, 1.0);
+  cloudCol = mix(cloudCol * vec3(1.22, 0.83, 0.62), cloudCol, sunUp);
+  // ---------- 空气透视：远处的云失去对比、溶进大气 ----------
+  // 没有这一步，远云会和近云一样黑白分明 → 天穹像贴了张高清贴图。
+  // 溶进的目标色 ≈ 天空地平线的辐亮度量级（L~0.10，对应显示 ~0.87 的霾色）。
+  float haze = 1.0 - exp(-tDeck / 22000.0);
+  cloudCol = mix(cloudCol, vec3(0.105, 0.108, 0.115), haze * 0.85);
+  // 低仰角淡出（配合掠射 LOD 粗化，云可以延伸到 ~6° 仰角再交给大气雾）
+  alpha *= smoothstep(0.045, 0.11, ru);
+  // 接近云层高度时淡出（最后 500 m）：穿云前云场先收敛再消失，观感自然
+  alpha *= smoothstep(0.0, 500.0, above);
+  return vec4(cloudCol, alpha);
+}
+
 // 天空辐亮度：沿 rd 从相机出发积分到大气顶（或地面），sunDiscScale = 0 时不出太阳盘
 //   rCam = |地心→相机|，mu = dot(rd, up0)，返回已曝光、已 tone map 的线性显示色
 vec3 atmoSkyRadiance(vec3 rd, vec3 sunDir, float rCam, float mu, float steps, float sunDiscScale) {
@@ -307,6 +424,12 @@ vec3 atmoSkyRadiance(vec3 rd, vec3 sunDir, float rCam, float mu, float steps, fl
                             cosSun);
     L += disc * sunDiscScale * T * atmoSunOcclusion(rCam, dot(up0, sunDir)) * uAtmoSunIrradiance;
   }
+
+  // 云层合成：云在天空【之前】，同时遮住积分出的天色与太阳盘。
+  // 放在曝光/tone map 之前 ⇒ 天穹、水面反射、水下斯涅尔窗三处色调严格一致。
+  // 云辐亮度用太阳辐亮度同量级（真实云的反照率远高于瑞利天空，云比蓝天亮一个量级是对的）
+  vec4 cl = atmoCloudLayer(rd, up0, sunDir, uCloudTime);
+  L = mix(L, cl.rgb * uAtmoSunIrradiance * 0.30, cl.a);
 
   // 曝光 + Reinhard tone map：天穹与水面反射共用同一个函数 ⇒ 色调严格一致
   vec3 c = L * uAtmoExposure;
@@ -551,17 +674,39 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
   float backLit = pow(max(dot(V, -L), 0.0), 4.0);
   bodyColor += uScatteringColor * (backLit * crestHi * uCrestTranslucency);
 
-  // ---------- 7. 太阳高光：各向异性拉伸，形成顺着风向的闪鳞 ----------
-  // 【高光 LOD】远处纹素在屏幕上被严重压缩，mipmap 把高频法线平均掉了，
-  // 此时仍用 uSpecularPower（≈几度的高光瓣）必然打不中任何波面斜率，
-  // 结果太阳光路就是一片平滑的白斑 —— 真实/UE 的做法是随距离展宽高光瓣
-  // （roughness 随纹素覆盖增大），于是远处呈现的是"随波纹闪动的宽带"。
-  vec3  H     = normalize(L + V);
-  float NdH   = max(dot(N, H), 0.0);
-  float TdH   = dot(Te, H);
-  float aniso = mix(1.0, sqrt(max(1.0 - TdH * TdH, 0.0)), uSpecularAniso);
-  float specPow = mix(uSpecularPowerFar, uSpecularPower, fadeHigh);
-  float spec  = uSpecularIntensity * pow(NdH, specPow) * aniso;
+  // ---------- 7. 太阳高光：GGX 各向异性（UE 同款公式，v21）----------
+  // 【为什么换 GGX】旧实现是 Blinn-Phong 幂（pow(NdH, n)）：峰值尖锐、衰减是指数型
+  // 的"断崖"；真实波面的坡度是统计分布，UE 的 SingleLayerWater 用 GGX —— 长尾衰减
+  // 让光路从"亮核+硬边"变成"亮核+渐远的银色尾迹"，这正是实拍海面光路的样子。
+  // 【高光 LOD 保留】粗糙度随距离增大（= 旧版"远处展宽高光瓣"的物理化表述），
+  // 换算沿用 α=sqrt(2/(n+2))，与旧参数量纲对齐：uSpecularPower 1200 / Far 260 不用重调。
+  // 【各向异性】UE 的 D_GGXaniso：沿切向（风流方向）拉长高光瓣 —— 闪鳞被拉成横向鳞片。
+  vec3  H    = normalize(L + V);
+  float NdH  = max(dot(N, H), 0.0);
+  float NdVc = max(dot(N, V), 1e-3);
+  float NdLc = max(dot(N, L), 0.0);
+  float rough = mix(sqrt(2.0 / (uSpecularPowerFar + 2.0)),
+                    sqrt(2.0 / (uSpecularPower + 2.0)), fadeHigh);
+  float ani  = clamp(uSpecularAniso, 0.0, 0.9);
+  float kA   = sqrt(max(1.0 - 0.9 * ani, 1e-3));
+  float at   = rough / kA;                       // 切向粗糙度（拉长方向）
+  float bt   = rough * kA;                       // 副切向粗糙度
+  float ToH  = dot(Te, H);
+  float BoH  = dot(Be, H);
+  float a2   = at * bt;
+  vec3  vw   = vec3(bt * ToH, at * BoH, a2 * NdH);
+  float v2   = dot(vw, vw);
+  float D    = a2 / max(ATMO_PI * v2 * v2, 1e-7);
+  D *= ATMO_PI * a2 * a2 * a2;                   // 峰值归一化：NoH=1 ⇒ D=1（旧版峰值行为对齐，参数不炸）
+                                                 // 【v21 修正】原写成 *π*a2，实际峰值 = 1/a2² ≈ 3.6e5
+                                                 // （rough=0.0408 时），整片海面被高光打爆成纯白。
+                                                 // 底式在 NoH=1 处 = 1/(π·a2³)，故正确因子是 π·a2³。
+  float VoH  = max(dot(V, H), 0.0);
+  float F    = 0.0201 + 0.9799 * pow(1.0 - VoH, 5.0);   // Schlick（IOR 1.33 的 F0）
+  float rv   = sqrt(max(NdVc * NdVc * (1.0 - rough * rough) + rough * rough, 1e-6));
+  float rl   = sqrt(max(NdLc * NdLc * (1.0 - rough * rough) + rough * rough, 1e-6));
+  float Vis  = 0.5 / max(NdLc * rv + NdVc * rl, 1e-4);  // Smith 联合近似（UE 同款）
+  float spec = uSpecularIntensity * D * F * Vis * NdLc;
   spec *= smoothstep(-0.05, 0.25, dot(N, L));    // 太阳落到地平线下即无高光
 
   // ---------- 8. 浪峰泡沫 ----------
@@ -1013,6 +1158,13 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
     multiLutSize: 32,
     skySteps: 32,                 // 天空步进数（常量上限见 GLSL 的 ATMO_SKY_MAX）
     apSteps: 8,                   // 气透视步进数
+    // ---- 程序化云层（v21：天穹/水面反射/水下斯涅尔窗共享同一朵云）----
+    cloudCover: 0.42,             // 云量 0..1（0 晴空 / 1 阴天）
+    cloudSharp: 0.30,             // 云边缘软硬（越大越碎越"絮"）
+    cloudSpeed: 0.008,            // 漂移速度（uv/秒，量级 ~ 真实微风）
+    // ---- 云层视差（v22：云是有高度的一层，缩放/平移相机会真实改变云场）----
+    cloudHeight: 2200,            // 云底离地高度 m（决定"拉近拉远时云的收敛发散"）
+    cloudScale: 650,              // 云团特征尺寸 m（一个 FBM 特征对应的世界尺寸）
   };
 
   // ---- 与 GLSL 逐字对应的参数化 ----
@@ -1392,6 +1544,15 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       uAtmoSkySteps: { type: Cesium.UniformType.FLOAT, value: P.skySteps },
       uAtmoAPSteps: { type: Cesium.UniformType.FLOAT, value: P.apSteps },
       uAtmoEnabled: { type: Cesium.UniformType.FLOAT, value: 1.0 },
+      // ---- 云层（v21）---- uCloudTime 每帧由水面 tick 写入（共享描述符 ⇒ 天穹同步动画）
+      uCloudCover: { type: Cesium.UniformType.FLOAT, value: P.cloudCover !== undefined ? P.cloudCover : 0.42 },
+      uCloudSharp: { type: Cesium.UniformType.FLOAT, value: P.cloudSharp !== undefined ? P.cloudSharp : 0.30 },
+      uCloudSpeed: { type: Cesium.UniformType.FLOAT, value: P.cloudSpeed !== undefined ? P.cloudSpeed : 0.008 },
+      // ---- 云层视差（v22）---- 高度/特征尺寸进投影，锚点定地理原点（世界系）
+      uCloudHeight: { type: Cesium.UniformType.FLOAT, value: P.cloudHeight !== undefined ? P.cloudHeight : 2200 },
+      uCloudScale:  { type: Cesium.UniformType.FLOAT, value: P.cloudScale !== undefined ? P.cloudScale : 650 },
+      uCloudAnchorWC: { type: Cesium.UniformType.VEC3, value: P.cloudAnchorWC ? P.cloudAnchorWC.clone() : new Cesium.Cartesian3(0, 0, 0) },
+      uCloudTime: { type: Cesium.UniformType.FLOAT, value: 0.0 },
     };
   }
 
@@ -1414,6 +1575,11 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
     }
     P.topRadius = P.bottomRadius + (options.atmosphereHeight || 100000);
     if (options.exposure !== undefined) P.exposure = options.exposure;
+    // 云层视差的地理锚点（v22）：优先 site，否则用当前相机位置 —— 必须非零，
+    // 着色器靠它把"云的世界位置"固定住，平移相机时云才会真实滑动而不是跟着镜头走
+    P.cloudAnchorWC = site
+      ? Cesium.Cartesian3.fromDegrees(site.lon, site.lat, site.height || 0)
+      : viewer.camera.positionWC.clone();
 
     report('生成大气 LUT（transmittance / multi-scattering）');
     const t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -1543,7 +1709,7 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       uWaveSpeedMid:      0.018,     //  40 m tile × 0.018 ≈ 0.72 m/s
       uWaveSpeedHigh:     0.088,     // 12.5 m tile × 0.088 ≈ 1.10 m/s
       uSpecularIntensity: 1.1,
-      uFoamThreshold:     0.55,
+      uFoamThreshold:     0.40,      // 调低（0.55→0.40）→ 泡沫覆盖更广，强化浪尖涌白与近岸翻涌
       uFoamColor:         '#eef7f5',
 
       // ---- 法线（涌浪 + 粗/中/细）----
@@ -1615,6 +1781,14 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       // 配合 farSea 提亮（见着色器 §5），0.35 既消斑又保留部分远场明暗波带。
       // 面板上可继续微调：再小更干净但波带变平，再大波带明显但暗斑回来。
       uBelowHorizonDark:  0.35,      // 反射落到地平线以下时混入"远海色"的比例（远场明暗波带的来源）
+      // ---- 云层（v21：物理天空反射的水面终于"有东西可反"）----
+      // 云在共享大气 GLSL 里，天穹/水面反射/水下斯涅尔窗三处同一朵云。
+      // 面板可调；uAtmoEnabled=0（解析天空退回）时云不出现。
+      uCloudCover:        0.42,      // 云量 0..1
+      uCloudSharp:        0.30,      // 云边缘软硬
+      uCloudSpeed:        0.008,     // 漂移速度
+      uCloudHeight:       2200,      // 云层高度 m（缩放升降时云场视差强度）
+      uCloudScale:        650,       // 云团特征尺寸 m
       // ---- 物理大气下的水面合成控制（详见着色器 §5 / §9.5 注释）----
       // 低太阳高度角时物理天空的地平线本身就是暖白（B-R≈-0.05），全强度反射 +
       // 全强度气透视会让中远景水面变成灰白板（用户实测反馈）。
@@ -1694,6 +1868,12 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       uAtmoReflGain:      0.50,
       uAtmoReflTint:      0.55,
       uAtmoApScale:       0.45,
+      // ---- 云层（v21）：湖面天更晴一些 ----
+      uCloudCover:        0.30,
+      uCloudSharp:        0.32,
+      uCloudSpeed:        0.005,
+      uCloudHeight:       1800,      // 湖面云层低一些
+      uCloudScale:        520,
       uSunColor:          '#fff6e2',
       uSunDiscCos:        0.99960,
       uSunDiscIntensity:  2.2,
@@ -2163,6 +2343,11 @@ void main(void)
     atmoFallback.uAtmoEnabled.value = 0;
     const sharedAtmo = (options.atmosphere && options.atmosphere.uniforms) ? options.atmosphere.uniforms : null;
     Object.assign(waterUniforms, sharedAtmo || atmoFallback);
+    // 云参数以【水面预设】为准回写：描述符可能被天穹共享（sharedAtmo），
+    // 回写到描述符对象上，天穹与水面同时生效 —— 湖泊少云/海洋多云各自成立
+    ['uCloudCover', 'uCloudSharp', 'uCloudSpeed', 'uCloudHeight', 'uCloudScale'].forEach(function (k) {
+      if (state[k] !== undefined && waterUniforms[k]) waterUniforms[k].value = state[k];
+    });
 
     const customShader = new Cesium.CustomShader({
       lightingModel: Cesium.LightingModel.UNLIT,   // 光照全部自算，走 UNLIT 最省
@@ -2215,6 +2400,8 @@ void main(void)
       if (seconds === lastSeconds) return;      // 同一帧内不重复写 uniform
       lastSeconds = seconds;
       customShader.setUniform('uTime', seconds);
+      // 云的漂移时间：写在本 tick 里，描述符与天穹共享 ⇒ 两处云同步动画
+      customShader.setUniform('uCloudTime', seconds);
     });
 
     // 注意：这里不再 report('完成') —— 约定是「最后一次上报之后由调用方收尾」，

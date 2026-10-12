@@ -88,8 +88,16 @@ underwater.setUnderwater(true);           // 入水（setUnderwater(false) 出�
 | `uScatteringColor` | 浅水散射色（正视水面时看到的颜色） |
 | `uGerstnerHeight` | 浪高（Gerstner 总振幅，米） |
 | `uTimeScale` | 动画整体快慢总控（0 = 静止） |
-| `uSpecularIntensity` / `uSpecularAniso` | 太阳高光强度 / 各向异性拉伸（闪鳞感） |
-| `uFoamThreshold` | 浪峰泡沫阈值（越高泡沫越少） |
+| `uSpecularIntensity` / `uSpecularAniso` | 太阳高光强度 / 各向异性拉伸（闪鳞感）。高光为 GGX 各向异性（UE `D_GGXaniso` + Schlick + Smith），长尾衰减 → "亮核 + 渐远银色尾迹" |
+| `uFoamThreshold` | 浪峰泡沫阈值（越高泡沫越少）。海洋 0.40 / 湖泊 0.72 |
+| `uCloudCover` / `uCloudSharp` / `uCloudSpeed` | 程序化云层：云量 0..1 / 不透明度斜率（小=薄透/大=厚实）/ 漂移速度。天穹、水面反射、水下斯涅尔窗三处同步（v21） |
+| `uCloudHeight` / `uCloudScale` | **云层高度 m / 云团特征尺寸 m**（v22）。云是有高度的一层：缩放升降时云场真实收敛/发散，平移时云随地理位置滑动（真视差）；相机升到云层高度附近整体淡出 |
+
+云的观感（v23）由四件事合成，缺一就假：**密度场**（大尺度团块 0.85 + 中尺度破碎 0.15，
+细八度当侵蚀）→ **光学厚度**（`alpha = 1-exp(-密度×斜距)`，薄边半透、近地平线连成云海）→
+**自阴影**（沿太阳方向偏移采样，亮边+灰蓝暗底）→ **空气透视**（远云溶进霾色）。
+关键坑：云的辐亮度必须与天空同量级（曝光 40 时 col ∈ [0.06, 0.6]），一旦超量级
+整个明暗区间被 Reinhard+伽马压进 0.85~0.97 的"死白带"，怎么调都是剪纸（实测）。
 | `uAlpha` | 整体通透度 |
 | `uEdgeFade` | 面片边缘羽化，让水面溶进下方真实影像 |
 | `uAtmoExposure` | 物理大气曝光（天穹 + 水面反射 + 气透视同步生效） |

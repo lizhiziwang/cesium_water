@@ -146,8 +146,17 @@ async function getJson(url) {
   let exitCode = 0;
   // 注意：Chromium 的 profile 目录必须放在工作区里。放到系统 %TEMP% 会被沙箱拦掉，
   // 表现是 chrome.exe 秒退且 DevTools 端口永远不监听。
-  const userDataDir = path.join(DIR, '..', '.probe', 'udd');
-  fs.rmSync(userDataDir, { recursive: true, force: true });
+  const probeRoot = path.join(DIR, '..', '.probe');
+  const sharedDir = path.join(probeRoot, 'udd');
+  let userDataDir = sharedDir;
+  try {
+    fs.rmSync(sharedDir, { recursive: true, force: true });
+  } catch (_) {
+    // 沙箱批量删除守卫可能拦截（.probe/udd 里常有上一轮被中断留下的几百个文件，
+    // 超过 50 个即触发 SAFE_DELETE_BULK_CONFIRM_REQUIRED）。退化方案：本轮用一个
+    // 唯一的 profile 目录，既避免复用被中断的残留 profile，也不需要批量删除。
+    userDataDir = path.join(probeRoot, 'udd_' + process.pid + '_' + Date.now());
+  }
   fs.mkdirSync(userDataDir, { recursive: true });
 
   try {
