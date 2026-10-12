@@ -90,7 +90,12 @@ const server = http.createServer((req, res) => {
   if (!fp.startsWith(DIR)) { res.writeHead(403); res.end('forbidden'); return; }
   fs.readFile(fp, (e, buf) => {
     if (e) { res.writeHead(404); res.end('404'); return; }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(fp)] || 'application/octet-stream' });
+    // no-store：本服务纯为调试预览，绝不能让浏览器缓存 —— 否则改完代码刷新还是旧版
+    // （"改了没生效"的三大来源之一：缓存 / 看错文件 / 真没修好，先把第一种钉死）。
+    res.writeHead(200, {
+      'Content-Type': MIME[path.extname(fp)] || 'application/octet-stream',
+      'Cache-Control': 'no-store',
+    });
     res.end(buf);
   });
 });

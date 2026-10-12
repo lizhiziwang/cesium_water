@@ -148,9 +148,206 @@ void vertexMain(VertexInput vsInput, inout czm_modelVertexOutput vsOutput) {
 `;
 
   // ==========================================================================
+  // Frostbite 大气 —— 共享 GLSL 块（天穹与水面共用同一份代码）
+  //   Sébastien Hillaire, "A Scalable and Production Ready Sky and Atmosphere
+  //   Rendering Technique"（EGSR 2020，即 Frostbite 大气）：
+  //     · Transmittance LUT   —— 预计算「某高度 + 某天顶角 → 大气顶」的透过率
+  //     · Multi-scattering LUT —— 预计算多次散射（无限次散射用几何级数近似）
+  //     · 天空射线步进         —— 单次散射 + 多次散射 + 太阳盘
+  //     · 气透视               —— 相机→片元 这段光程的透过率与入散射
+  //
+  //   【为什么全部在眼空间里算】
+  //   CustomShader 片元端能直接拿到的空间量只有 positionEC，以及 czm_* 内置量；
+  //   所以这里只额外传一个 uniform：uAtmoCenterEC =「地心在眼空间的位置」
+  //   （每帧 = viewMatrix × (0,0,0)，即视图矩阵的平移列）。有了它就能推出：
+  //     相机半径 r = |uAtmoCenterEC|、相机处"上" up0 = -normalize(uAtmoCenterEC)、
+  //     采样点半径 ri = |p0 + t·rd|、太阳在该点的天顶角 cos = dot(up_i, sunDir)。
+  //   于是天穹的片元和水的片元可以共用同一段大气代码，参数、LUT 也完全一致。
+  //
+  //   【两个 LUT 的参数化必须与 JS 生成端严格一致】（见 buildTransmittanceLUT）
+  //     v 轴：v = (r² − Rb²)/(Rt² − Rb²)     —— 近地面分配更多行（密度变化快）
+  //     u 轴：u = sqrt((mu − muH(r))/(1 − muH(r)))，muH = 地平线天顶角余弦
+  //           —— 采样点密度偏向地平线（掠射时透过率变化最快的地方）
+  // ==========================================================================
+  const ATMOSPHERE_GLSL = `
+// ============================ Frostbite 大气（共享） ============================
+// 【uniform 声明不在这里】Cesium 的 CustomShader 会按 uniformMap 自动生成
+// uniform 声明并注入着色器头部 —— 这里再写一遍就是 redefinition（实测编译失败）。
+// 各 uniform 的含义见 atmoUniformSet() 的字段注释。
+//
+//   uAtmoTransLUT / uAtmoMultiLUT  两张 LUT（HALF_FLOAT，线性过滤）
+//   uAtmoCenterEC                  地心在【眼空间】的位置（每帧写入，唯一的逐帧 uniform）
+//   uAtmoRayleigh / uAtmoRayleighH 瑞利散射系数 (1/m) 与标高 (m)
+//   uAtmoMieScatter/MieAbsorb/MieH/MieG  米氏散射/吸收系数、标高、相函数 g
+//   uAtmoOzone / OzoneCenter / OzoneWidth  臭氧吸收 (1/m) 与帐篷分布参数 (m)
+//   uAtmoBottomR / uAtmoTopR       地面 / 大气顶半径 (m)
+//   uAtmoH0 / uAtmoHScale          高度映射 h = h0·(e^(v·K)−1) 的两个常数
+//   uAtmoMultiScale / uAtmoSunIrradiance / uAtmoExposure   亮度三总控
+//   uAtmoSunDiscCos / uAtmoSunDiscScale    太阳盘（cos 角半径 / 强度）
+//   uAtmoSkySteps / uAtmoAPSteps   天空 / 气透视步进数
+//   uAtmoEnabled                   0 = 水面退回解析天空（A/B 用）
+
+const float ATMO_PI = 3.141592653589793;
+const int   ATMO_SKY_MAX = 64;        // 循环上限必须是常量（GLSL ES 约束）
+const int   ATMO_AP_MAX  = 16;
+
+float atmoDensR(float h) { return exp(-h / max(uAtmoRayleighH, 1.0)); }
+float atmoDensM(float h) { return exp(-h / max(uAtmoMieH, 1.0)); }
+// 臭氧：以 25 km 为中心的帐篷（tent）分布，Hillaire 的写法
+float atmoDensO(float h) { return max(0.0, 1.0 - abs(h - uAtmoOzoneCenter) / max(uAtmoOzoneWidth, 1.0)); }
+
+float atmoMuHorizon(float r) {
+  float k = min(1.0, uAtmoBottomR / max(r, 1.0));
+  return -sqrt(max(0.0, 1.0 - k * k));
+}
+// 高度 → v：指数映射（近地面分辨率高），与 JS 的 atmoVFromH 逐字对应
+float atmoVFromH(float h) { return log(1.0 + max(h, 0.0) / uAtmoH0) / uAtmoHScale; }
+// (r, mu) → LUT 的 uv（与 JS 生成端逐字对应，改一边必须改另一边）
+vec2 atmoUv(float r, float mu) {
+  float v = clamp(atmoVFromH(r - uAtmoBottomR), 0.0, 1.0);
+  float mh = atmoMuHorizon(r);
+  // 地平线以下直接钳到地平线 —— 天空积分用不到它，气透视的「除法技巧」也要求如此
+  float u = sqrt(clamp((mu - mh) / max(1.0 - mh, 1e-6), 0.0, 1.0));
+  return vec2(u, v);
+}
+vec3 atmoTransmittance(float r, float mu) {
+  return texture(uAtmoTransLUT, atmoUv(r, mu)).rgb;
+}
+// 多次散射 LUT 的 u 轴是线性的 mu ∈ [-1,1]（它的量随天顶角变化平缓）
+vec3 atmoMultiScatter(float r, float mu) {
+  float v = clamp(atmoVFromH(r - uAtmoBottomR), 0.0, 1.0);
+  return texture(uAtmoMultiLUT, vec2(clamp(mu * 0.5 + 0.5, 0.0, 1.0), v)).rgb;
+}
+
+// 射线与地面球的最近正向交点，无交返回 -1
+float atmoGroundT(float r, float mu) {
+  float b = r * mu;
+  float c = r * r - uAtmoBottomR * uAtmoBottomR;
+  float d = b * b - c;
+  if (d < 0.0) return -1.0;
+  float sq = sqrt(d);
+  float t0 = -b - sq;
+  if (t0 > 0.0) return t0;
+  float t1 = -b + sq;
+  return t1 > 0.0 ? t1 : -1.0;
+}
+// 射线离开大气顶的正向交点（相机在大气层内，故取远根）
+float atmoTopT(float r, float mu) {
+  float b = r * mu;
+  float c = r * r - uAtmoTopR * uAtmoTopR;
+  return -b + sqrt(max(b * b - c, 0.0));
+}
+// 太阳被行星本身遮挡的软判据（决定昼夜分界与晨昏线，比"相机处太阳高度"正确：
+// 高空样点即使地面已日落仍能看到太阳，这正是暮光发亮的来源）
+float atmoSunOcclusion(float r, float muSun) {
+  float mh = atmoMuHorizon(r);
+  return smoothstep(mh - 0.015, mh + 0.015, muSun);
+}
+
+float atmoPhaseR(float c) { return 0.05968310365946075 * (1.0 + c * c); }  // 3/(16π)
+float atmoPhaseM(float c) {                                              // Henyey-Greenstein
+  float g = uAtmoMieG;
+  float g2 = g * g;
+  return (1.0 - g2) / (4.0 * ATMO_PI * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+}
+
+// 单个步长的散射源项（不含累积透过率）
+vec3 atmoScatterSource(float h, float cosSun, float ri, float muSun) {
+  float dR = atmoDensR(h);
+  float dM = atmoDensM(h);
+  vec3  Tsun = atmoTransmittance(ri, muSun) * atmoSunOcclusion(ri, muSun);
+  vec3  multi = atmoMultiScatter(ri, muSun) * uAtmoMultiScale;
+  vec3  scat = dR * uAtmoRayleigh * atmoPhaseR(cosSun)
+             + dM * uAtmoMieScatter * atmoPhaseM(cosSun);
+  // 多次散射：各向同性，用 (瑞利+米氏) 的散射系数加权 —— Hillaire 的写法
+  vec3  iso = (dR * uAtmoRayleigh + dM * uAtmoMieScatter) * multi;
+  return (scat * Tsun + iso) * uAtmoSunIrradiance;
+}
+
+// 天空辐亮度：沿 rd 从相机出发积分到大气顶（或地面），sunDiscScale = 0 时不出太阳盘
+//   rCam = |地心→相机|，mu = dot(rd, up0)，返回已曝光、已 tone map 的线性显示色
+vec3 atmoSkyRadiance(vec3 rd, vec3 sunDir, float rCam, float mu, float steps, float sunDiscScale) {
+  vec3  p0 = -uAtmoCenterEC;                    // 相机相对地心
+  vec3  up0 = p0 / max(rCam, 1.0);
+  float tTop = atmoTopT(rCam, mu);
+  float tGnd = atmoGroundT(rCam, mu);
+  float tMax = (tGnd > 0.0 && tGnd < tTop) ? tGnd : tTop;
+  float dt = tMax / max(steps, 1.0);
+
+  vec3  L = vec3(0.0);
+  vec3  T = vec3(1.0);
+  float cosSun = dot(rd, sunDir);
+  for (int i = 0; i < ATMO_SKY_MAX; i++) {
+    if (float(i) >= steps) break;
+    float t  = (float(i) + 0.5) * dt;
+    vec3  p  = p0 + rd * t;
+    float ri = length(p);
+    vec3  upi = p / max(ri, 1e-3);
+    float h  = max(ri - uAtmoBottomR, 0.0);
+    float muSun = dot(upi, sunDir);
+    vec3  ext = atmoDensR(h) * uAtmoRayleigh
+              + atmoDensM(h) * (uAtmoMieScatter + uAtmoMieAbsorb)
+              + atmoDensO(h) * uAtmoOzone;
+    vec3  Tstep = exp(-ext * dt);
+    // 段内解析积分： ∫₀^dt T(t) dt = T(0)·(1 − exp(−ext·dt))/ext
+    vec3  segT = (1.0 - Tstep) / max(ext, vec3(1e-9));
+    L += atmoScatterSource(h, cosSun, ri, muSun) * T * segT;
+    T *= Tstep;
+  }
+
+  // 太阳盘：加在积分末尾（它在大气层外，故只被整段透过率衰减）
+  if (sunDiscScale > 0.0) {
+    float disc = smoothstep(uAtmoSunDiscCos, uAtmoSunDiscCos + (1.0 - uAtmoSunDiscCos) * 0.6,
+                            cosSun);
+    L += disc * sunDiscScale * T * atmoSunOcclusion(rCam, dot(up0, sunDir)) * uAtmoSunIrradiance;
+  }
+
+  // 曝光 + Reinhard tone map：天穹与水面反射共用同一个函数 ⇒ 色调严格一致
+  vec3 c = L * uAtmoExposure;
+  return c / (1.0 + c);
+}
+
+// 气透视：相机 → 距离 tPoint 处的片元。输出该段透过率与入散射（均已曝光+tone map）
+void atmoAerialPerspective(vec3 rd, float tPoint, vec3 sunDir, out vec3 apT, out vec3 apS) {
+  vec3  p0 = -uAtmoCenterEC;
+  float rCam = length(p0);
+  float mu = dot(rd, p0 / max(rCam, 1.0));
+  // 远处只算到大气顶为止
+  float tTop = atmoTopT(rCam, mu);
+  float tGnd = atmoGroundT(rCam, mu);
+  float tLim = (tGnd > 0.0 && tGnd < tTop) ? tGnd : tTop;
+  float t = min(tPoint, tLim);
+  float dt = t / max(uAtmoAPSteps, 1.0);
+
+  vec3  T = vec3(1.0);
+  vec3  L = vec3(0.0);
+  float cosSun = dot(rd, sunDir);
+  for (int i = 0; i < ATMO_AP_MAX; i++) {
+    if (float(i) >= uAtmoAPSteps) break;
+    float ti = (float(i) + 0.5) * dt;
+    vec3  p  = p0 + rd * ti;
+    float ri = length(p);
+    vec3  upi = p / max(ri, 1e-3);
+    float h  = max(ri - uAtmoBottomR, 0.0);
+    float muSun = dot(upi, sunDir);
+    vec3  ext = atmoDensR(h) * uAtmoRayleigh
+              + atmoDensM(h) * (uAtmoMieScatter + uAtmoMieAbsorb)
+              + atmoDensO(h) * uAtmoOzone;
+    vec3  Tstep = exp(-ext * dt);
+    vec3  segT = (1.0 - Tstep) / max(ext, vec3(1e-9));
+    L += atmoScatterSource(h, cosSun, ri, muSun) * T * segT;
+    T *= Tstep;
+  }
+  apT = T;
+  vec3 c = L * uAtmoExposure;
+  apS = c / (1.0 + c);
+}
+`;
+
+  // ==========================================================================
   // 片元着色器：UE5 SingleLayerWater 近似
   // ==========================================================================
-  const FRAGMENT_SHADER = `
+  const FRAGMENT_SHADER = ATMOSPHERE_GLSL + `
 // ============================ 片元着色器 ============================
 // 对标 UE5 SingleLayerWater，受 Cesium 限制：
 //  - 无屏幕深度采样 => 无真实水体厚度，"吸收/散射"用视角光程近似；
@@ -241,33 +438,54 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
   float NdV     = clamp(dot(N, V), 0.0, 1.0);
   float fresnel = F0 + (1.0 - F0) * pow(1.0 - NdV, uFresnelPower);
 
+  // 一阶微坡项：d(NdV) 恰好 = "坡度向量 · 视线在切平面的投影"。
+  // 掠射角下（低机位看远水面，NdV≈0.2）它就是灰板问题的钥匙 —— 见下一节。
+  // 【只取涟漪层】涌浪层(s3)是真实的大尺度倾斜（远处权重 0.78、坡度可达 0.4），
+  // 它对反射仰角的影响已经完整包含在 R 里，绝不能再进放大项 ——
+  // 否则远场 elev 被推 ±1.2、skyT 大面积撞钳位，整片海退化成灰斑（实测翻车）。
+  vec2  Vtb         = vec2(dot(Te, V), dot(Be, V));
+  vec2  slopeRipple = slope - s3 * swellBoost;
+  float micro       = dot(slopeRipple * uNormalStrength, Vtb);
+
   // ---------- 5. 解析天空反射 ----------
   // 仰角 elev: 反射方向与"上"的夹角余弦；0 = 地平线，1 = 天顶
+  // 【掠射"灰板"】低机位看中景水面时 NdV≈0.2，fresnel 高达 0.4~0.7 —— 颜色六七成
+  // 是反射的天空；而掠射角反射到的是【地平线附近的平滑渐变】，涟漪让反射仰角
+  // 抖动的那一点点（实测 Δelev 仅 ±0.03，被 mipmap 平均 + 归一化压缩）根本显不出
+  // 结构，于是一整片一整片的缓坡成了无纹理的平坦石板灰（实测用户截图、8m 机位可复现）。
+  // 物理上反射角的抖动 ≈ 2× 微坡抖动 —— 这里把 micro 直接加回 elev 并放大补偿：
+  // 让反射的"天空采样位置"随涟漪高频移动，灰板碎成随波流动的明暗。
   vec3  R    = reflect(-V, N);
-  float elev = dot(R, upEC);
+  float microC = clamp(micro * 3.0, -0.35, 0.35);   // 微坡补偿（两种天空模式共用）
+  float elev = dot(R, upEC) + microC;
   float skyT = clamp(elev, 0.0, 1.0);
-
-  // 天顶 -> 地平线 渐变，再压一层地平线雾带，形成那条典型的亮边
-  vec3 sky = mix(uHorizonColor, uSkyColor, pow(skyT, uSkyGradientPow));
-  sky = mix(sky, uHorizonHaze, (1.0 - smoothstep(0.0, 0.12, skyT)) * uHorizonHazeStrength);
-
-  // 【地平线以下反射的是"远处的海面"，不是天空 —— 不能只把天空色乘暗】
-  // 反射方向落到地平线以下，打到的是远场海面/地表。之前偷懒用 sky *= (1-0.70)：
-  // 亮色天空被压暗后是"中灰"，再被高菲涅尔（这类背坡面片 NdV 小）放大，
-  // 就是大片平灰斑块（实测用户截图红框）。
-  // 正确做法：往"远海色"（深水基色方向的暗青蓝）混合 —— 明暗波带的对比还在
-  // （这就是 uBelowHorizonDark 的作用），但色调是暗海而不是死灰。
-  float belowT = 1.0 - smoothstep(-0.06, 0.0, elev);       // 1 = 地平线以下
-  vec3  farSea  = uAbsorptionColor * 0.85 + uScatteringColor * 0.08;
-  vec3  reflCol = mix(sky, farSea, belowT * uBelowHorizonDark);
-
   float sunDot = dot(R, L);
 
-  // 【宽角前向散射】真实天空在太阳周围一大片区域都会变亮（气溶胶 + 分子散射），
-  // 不只是太阳盘本身。缺了它，水面反光没有"方向感"。
-  // 但注意量级：这是"增亮"，不是"加白色洪水"。pow 取 20（约 10° 内最强、45° 外基本
-  // 衰减完），强度给 0.45 左右 —— 给大了整个反射面会被冲成灰白（第一版 0.55/pow6 就翻车）。
-  sky += pow(max(sunDot, 0.0), 20.0) * uSkyForwardScatter * uSunColor;
+  vec3  reflCol;
+  if (uAtmoEnabled > 0.5) {
+    // ---- Frostbite 物理天空反射 ----
+    // 与天穹共用 atmoSkyRadiance + 同一批 uniform ⇒ 水天色调严格自洽，不再靠
+    // 手调 uSkyColor/uHorizonColor 对齐。反射从片元出发与从相机出发的差别相对
+    // 大气尺度可忽略，直接用相机处的天穹；微坡补偿照旧加在反射仰角上。
+    float rCamA = length(uAtmoCenterEC);
+    vec3  up0A  = -uAtmoCenterEC / max(rCamA, 1.0);
+    vec3  rdR   = normalize(R + up0A * microC);
+    // 反射里不出太阳盘：太阳亮路由下面的 spec/sunGlow 专管，两套太阳会穿帮。
+    // 步数封顶 20：反射是"第二跳"光线，天穹那份精度在水面里看不出差别。
+    reflCol = atmoSkyRadiance(rdR, L, rCamA, dot(rdR, up0A), min(uAtmoSkySteps, 20.0), 0.0);
+  } else {
+    // ---- 解析天空（uAtmoEnabled=0 时退回）----
+    // 天顶 -> 地平线 渐变，再压一层地平线雾带，形成那条典型的亮边
+    vec3 sky = mix(uHorizonColor, uSkyColor, pow(skyT, uSkyGradientPow));
+    sky = mix(sky, uHorizonHaze, (1.0 - smoothstep(0.0, 0.12, skyT)) * uHorizonHazeStrength);
+    // 【地平线以下反射的是"远处的海面"，不是天空 —— 不能只把天空色乘暗】
+    // 反射方向落到地平线以下，打到的是远场海面/地表。往"远海色"（深水基色方向的
+    // 暗青蓝）混合 —— 明暗波带的对比还在，但色调是暗海而不是死灰。
+    float belowT = 1.0 - smoothstep(-0.06, 0.0, elev);       // 1 = 地平线以下
+    vec3  farSea  = uAbsorptionColor * 0.45 + uScatteringColor * 0.30;
+    sky += pow(max(sunDot, 0.0), 20.0) * uSkyForwardScatter * uSunColor;
+    reflCol = mix(sky, farSea, belowT * uBelowHorizonDark);
+  }
 
   // 太阳盘（镜面里的太阳像） + 窄辉光（贴着光路的核心）
   float sunDisc = smoothstep(uSunDiscCos, uSunDiscCos + 0.0004, sunDot);
@@ -325,13 +543,23 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
   color += spec * uSunColor;
   color  = mix(color, uFoamColor, foam);
 
-  // ---------- 9.5 大气透视：与 Cesium 给地表影像加的距离雾保持一致 ----------
+  // ---------- 9.5 大气透视 ----------
   // Cesium 对 globe 上的影像瓦片会应用 scene.fog（远处被压向天色），而模型是 UNLIT
   // 的 CustomShader，【不会】自动得到这层雾。不补上的话，拉远看时水面比周围的
   // 影像海面更深、更饱和 —— 一眼就能看出那是一块"贴上去的方片"。
-  // 这里用与 czm_fog 相同的二次型 1 - exp(-(d·ρ)²)，密度做成可调以便对齐不同底图。
-  float hazeT = 1.0 - exp(-pow(viewDist * uHazeDensity, 2.0));
-  color = mix(color, uHorizonHaze, hazeT);
+  if (uAtmoEnabled > 0.5) {
+    // ---- Frostbite 物理气透视：沿视线从相机积分到片元，替代手调二次雾 ----
+    // 与天穹同一套物理：远处水面自然沉入大气色，水天线不再需要雾色对齐。
+    // 合成式 color·T + S：apT 是原始光谱透过率（≤1），apS 已曝光 + tone map ——
+    // 水色是手调的显示空间颜色，这个组合正是把"水面"压进"大气"的标准近似。
+    vec3 apT, apS;
+    atmoAerialPerspective(normalize(posEC), viewDist, L, apT, apS);
+    color = color * apT + apS;
+  } else {
+    // 解析雾：与 czm_fog 相同的二次型 1 - exp(-(d·ρ)²)，密度可调以便对齐不同底图
+    float hazeT = 1.0 - exp(-pow(viewDist * uHazeDensity, 2.0));
+    color = mix(color, uHorizonHaze, hazeT);
+  }
 
   // ---------- 10. 水下：从下方看水面（斯涅尔窗 + 全反射）----------
   // 相机在水面以下时，水面就成了"天花板"。物理上：
@@ -374,8 +602,20 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
     float uSunHalo  = pow(usc, 40.0) * 0.75                    // 贴盘辉光
                     + pow(usc, 8.0)  * 0.15;                   // 大范围天空增亮
 
-    vec3 skyThru = mix(uHorizonColor, uSkyColor, 0.55) * 1.05
-                 + (uSunBody + uSunHalo) * uSunColor;          // 窗内：折射出去的天空 + 太阳透光
+    vec3 skyThru;
+    if (uAtmoEnabled > 0.5 && refrOK > 0.5) {
+      // 窗内直接看折射方向的物理天空（与天穹同一函数）—— 水下看到的天色也自洽。
+      // 太阳透光仍用上面的解析盘：折射方向随波面抖动，物理太阳盘（0.27°）会被
+      // 抖成噪声，解析的 900 次幂宽盘才是"随波闪动的亮斑"的正确量级。
+      vec3 rdRe = normalize(refrAir);
+      float rCamU = length(uAtmoCenterEC);
+      vec3  up0U  = -uAtmoCenterEC / max(rCamU, 1.0);
+      skyThru = atmoSkyRadiance(rdRe, L, rCamU, dot(rdRe, up0U), min(uAtmoSkySteps, 16.0), 0.0)
+              + (uSunBody + uSunHalo) * uSunColor;
+    } else {
+      skyThru = mix(uHorizonColor, uSkyColor, 0.55) * 1.05
+              + (uSunBody + uSunHalo) * uSunColor;           // 窗内：折射出去的天空 + 太阳透光
+    }
     vec3 tir     = uAbsorptionColor + uScatteringColor * 0.10;  // 窗外：全反射，看到的是水体而非死黑
     vec3 underCol = mix(tir, skyThru, wnd);
 
@@ -697,6 +937,544 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
   }
 
   // ==========================================================================
+  // Frostbite 大气 —— JS 侧：参数、LUT 生成、天穹、对外接口
+  //
+  //  【LUT 为什么要预计算】每像素实时积分整层大气（几十步 × 每步密度/透过率）
+  //  在天空上还撑得住，但水面每个像素都要再算一次反射方向 + 一次气透视，
+  //  成本立刻翻几倍。Hillaire 的办法是把两件与视角无关的积分预先烘成小贴图：
+  //    · transmittance 256×64：三个通道的透过率，随「半径 + 天顶角」变化
+  //    · multi-scattering 32×32：多次散射的辐亮度，随「半径 + 太阳天顶角」变化
+  //  生成成本：transmittance 约 1M 次采样、multi-scattering 约 2M 次 ——
+  //  两者都是纯算术，在 JS 里总耗时约 0.3~1 s（启动时一次，之后零成本）。
+  //
+  //  【参数化必须与 GLSL 侧逐字一致】改这里就必须同步改 atmoUv() / atmoMultiScatter()。
+  // ==========================================================================
+  const ATMOSPHERE_PRESET = {
+    bottomRadius: 6368000,        // 运行时会被 site 的实际地心半径覆盖
+    topRadius: 6468000,           // 默认 = 地面 + 100 km
+    rayleighScattering: [5.802e-6, 13.558e-6, 33.100e-6],   // (1/m) 瑞利散射系数
+    rayleighScaleHeight: 8000,    // 瑞利标高 (m)
+    mieScattering: 3.996e-6,      // 米氏散射系数 (1/m)
+    mieAbsorption: 4.400e-6,      // 米氏吸收系数 (1/m)
+    mieScaleHeight: 1200,         // 米氏标高 (m)
+    miePhaseG: 0.8,               // HG 相函数各向异性（决定太阳周围的强前向散射）
+    ozoneAbsorption: [0.650e-6, 1.881e-6, 0.085e-6],         // 臭氧吸收（蓝天的来源之一）
+    ozoneCenterHeight: 25000,
+    ozoneWidth: 15000,
+    multiScatteringFactor: 0.5,   // 几何级数公比 f：多次散射 ≈ L2/(1−f)
+    sunAngularRadius: 0.004675,   // 太阳角半径 ≈0.268°
+    sunIrradiance: 1.0,
+    exposure: 40.0,               // 曝光（把散射辐亮度映射到显示区间）
+    transmittanceLutWidth: 256,
+    transmittanceLutHeight: 64,
+    multiLutSize: 32,
+    skySteps: 32,                 // 天空步进数（常量上限见 GLSL 的 ATMO_SKY_MAX）
+    apSteps: 8,                   // 气透视步进数
+  };
+
+  // ---- 与 GLSL 逐字对应的参数化 ----
+  //
+  // 【高度映射：不用 Hillaire 原版的 r² 线性映射】
+  // 原版 v ∈ [0,1] → r = sqrt(Rb² + v(Rt²−Rb²))，在 64 行下近地面每行跨约 1560 m，
+  // 而米氏标高只有 1200 m —— 结果是"海平面相机"采样到的其实是 788 m 高处的透过率，
+  // 天空整体偏亮、夕阳不够红（自检里相对误差 -10% 就是这么来的）。
+  // 海洋 Demo 的相机永远贴着地面，所以改成【指数映射】把分辨率压到近地面：
+  //     h(v) = H0·(e^(v·K) − 1),  K = ln(1 + hMax/H0)
+  //   64 行时：最底行中心 ≈ 10 m，10 km 处仍有 ~1 km 的分辨率。
+  const ATMO_H0 = 500;                       // 指数映射的参考高度 (m)
+  function atmoHeightMapping(P) {
+    if (P.h0 === undefined) {
+      P.h0 = ATMO_H0;
+      P.hScale = Math.log1p(Math.max(P.topRadius - P.bottomRadius, 1) / P.h0);
+    }
+    return P;
+  }
+  function atmoHFromV(v, P) { return P.h0 * Math.expm1(Math.min(Math.max(v, 0), 1) * P.hScale); }
+  function atmoVFromH(h, P) { return Math.log1p(Math.max(h, 0) / P.h0) / P.hScale; }
+  function atmoRadiusFromV(v, P) { return P.bottomRadius + atmoHFromV(v, P); }
+  function atmoMuHorizonJS(r, Rb) {
+    const k = Math.min(1, Rb / Math.max(r, 1e-6));
+    return -Math.sqrt(Math.max(0, 1 - k * k));
+  }
+  function atmoMuFromU(u, r, Rb) {
+    const mh = atmoMuHorizonJS(r, Rb);
+    const t = Math.min(Math.max(u, 0), 1);
+    return mh + (1 - mh) * t * t;
+  }
+  function atmoUFromMu(mu, r, Rb) {
+    const mh = atmoMuHorizonJS(r, Rb);
+    return Math.sqrt(Math.min(Math.max((mu - mh) / Math.max(1 - mh, 1e-6), 0), 1));
+  }
+  function atmoTentOzone(h, P) {
+    return Math.max(0, 1 - Math.abs(h - P.ozoneCenterHeight) / P.ozoneWidth);
+  }
+  // 分段指数积分：∫exp(-h/H)dt，h 在该段内按线性近似
+  function atmoSegExp(h1, h2, invScaleH, dt) {
+    const dh = h2 - h1;
+    const e1 = Math.exp(-h1 * invScaleH);
+    if (Math.abs(dh) < 1e-6) return dt * e1;
+    const e2 = Math.exp(-h2 * invScaleH);
+    return dt * (e1 - e2) / (dh * invScaleH);
+  }
+  // LUT 双线性采样（与 GLSL 的 texture() 行为一致，供 multi-scattering 生成与校验用）
+  function atmoSampleLutChannel(lut, u, v, ch) {
+    const W = lut.width, H = lut.height, d = lut.data;
+    const x = u * W - 0.5, y = v * H - 0.5;
+    const x0 = Math.floor(x), y0 = Math.floor(y);
+    const fx = x - x0, fy = y - y0;
+    const cx0 = Math.min(Math.max(x0, 0), W - 1), cx1 = Math.min(Math.max(x0 + 1, 0), W - 1);
+    const cy0 = Math.min(Math.max(y0, 0), H - 1), cy1 = Math.min(Math.max(y0 + 1, 0), H - 1);
+    const a = d[(cy0 * W + cx0) * 4 + ch], b = d[(cy0 * W + cx1) * 4 + ch];
+    const c = d[(cy1 * W + cx0) * 4 + ch], e = d[(cy1 * W + cx1) * 4 + ch];
+    return (a + (b - a) * fx) * (1 - fy) + (c + (e - c) * fx) * fy;
+  }
+  function atmoSampleTransmittanceRGB(lut, r, mu, Rb, Rt) {
+    const h = Math.max(r - Rb, 0);
+    const P0 = { h0: ATMO_H0, hScale: Math.log1p(Math.max(Rt - Rb, 1) / ATMO_H0) };
+    const v = Math.min(Math.max(atmoVFromH(h, P0), 0), 1);
+    const u = atmoUFromMu(mu, r, Rb);
+    return [
+      atmoSampleLutChannel(lut, u, v, 0),
+      atmoSampleLutChannel(lut, u, v, 1),
+      atmoSampleLutChannel(lut, u, v, 2),
+    ];
+  }
+
+  // ---- Transmittance LUT：从 (r, mu) 走到大气顶的光学厚度 ----
+  function buildTransmittanceLUT(P) {
+    atmoHeightMapping(P);
+    const W = P.transmittanceLutWidth, H = P.transmittanceLutHeight;
+    const Rb = P.bottomRadius, Rt = P.topRadius;
+    const invHr = 1 / P.rayleighScaleHeight;
+    const invHm = 1 / P.mieScaleHeight;
+    // 128 步：地平线附近的掠射光线程最长（Chapman 可达 20 倍），
+    // 段内高度线性化的误差 ~ O(dt²)，步数翻倍可把最差相对误差压到 <0.3%。
+    const STEPS = 128;
+    const data = new Float32Array(W * H * 4);
+    for (let j = 0; j < H; j++) {
+      const r = atmoRadiusFromV((j + 0.5) / H, P);
+      for (let i = 0; i < W; i++) {
+        const mu = atmoMuFromU((i + 0.5) / W, r, Rb);
+        const b = r * mu;
+        const tTop = -b + Math.sqrt(Math.max(b * b - (r * r - Rt * Rt), 0));
+        const dt = tTop / STEPS;
+        let odR = 0, odM = 0, odO = 0;
+        let r1 = r;
+        for (let s = 0; s < STEPS; s++) {
+          const t2 = (s + 1) * dt;
+          const r2 = Math.sqrt(r * r + t2 * t2 + 2 * r * mu * t2);
+          const h1 = Math.max(r1 - Rb, 0);
+          const h2 = Math.max(r2 - Rb, 0);
+          odR += atmoSegExp(h1, h2, invHr, dt);
+          odM += atmoSegExp(h1, h2, invHm, dt);
+          odO += 0.5 * dt * (atmoTentOzone(h1, P) + atmoTentOzone(h2, P));
+          r1 = r2;
+        }
+        const k = (j * W + i) * 4;
+        for (let c = 0; c < 3; c++) {
+          const ext = P.rayleighScattering[c] * odR
+                    + (P.mieScattering + P.mieAbsorption) * odM
+                    + P.ozoneAbsorption[c] * odO;
+          data[k + c] = Math.exp(-ext);
+        }
+        data[k + 3] = 1;
+      }
+    }
+    return { data, width: W, height: H };
+  }
+
+  // 一阶（单次）散射：沿 nu 方向从 (r0) 出发，积分到达该点的太阳散射辐亮度
+  //   —— multi-scattering LUT 的被积函数。局部标架：up=(0,1,0)，太阳方位角 0。
+  function atmoIntegrateFirstOrder(r0, nu, sun, P, lut) {
+    const Rb = P.bottomRadius, Rt = P.topRadius;
+    const STEPS = 32;
+    const mu0 = nu[1];
+    const b = r0 * mu0;
+    const c = r0 * r0 - Rb * Rb;
+    const disc = b * b - c;
+    let tGnd = -1;
+    if (disc >= 0) {
+      const sq = Math.sqrt(disc);
+      if (-b - sq > 0) tGnd = -b - sq;
+      else if (-b + sq > 0) tGnd = -b + sq;
+    }
+    const tTop = -b + Math.sqrt(Math.max(b * b - (r0 * r0 - Rt * Rt), 0));
+    const tMax = (tGnd > 0 && tGnd < tTop) ? tGnd : tTop;
+    const dt = tMax / STEPS;
+    const Ta = atmoSampleTransmittanceRGB(lut, r0, mu0, Rb, Rt);   // 常量，提出循环
+    const cosSun = nu[0] * sun[0] + nu[1] * sun[1] + nu[2] * sun[2];
+    const pr = 0.05968310365946075 * (1 + cosSun * cosSun);
+    const g = P.miePhaseG, g2 = g * g;
+    const pm = (1 - g2) / (4 * Math.PI * Math.pow(Math.max(1 + g2 - 2 * g * cosSun, 1e-4), 1.5));
+    let out = [0, 0, 0];
+    for (let s = 0; s < STEPS; s++) {
+      const t = (s + 0.5) * dt;
+      const px = t * nu[0], py = r0 + t * nu[1], pz = t * nu[2];
+      const ri = Math.sqrt(px * px + py * py + pz * pz);
+      const h = Math.max(ri - Rb, 0);
+      const muSun = (px * sun[0] + py * sun[1] + pz * sun[2]) / ri;
+      const muView = (r0 * mu0 + t) / ri;
+      const Tsun = atmoSampleTransmittanceRGB(lut, ri, muSun, Rb, Rt);
+      // T(相机/起点 → 该点) = T(起点→顶) / T(该点→顶)  —— 同一条直线上的除法技巧
+      const Tb = atmoSampleTransmittanceRGB(lut, ri, muView, Rb, Rt);
+      const dR = Math.exp(-h / P.rayleighScaleHeight);
+      const dM = Math.exp(-h / P.mieScaleHeight);
+      for (let ch = 0; ch < 3; ch++) {
+        const beta = P.rayleighScattering[ch] * dR * pr + P.mieScattering * dM * pm;
+        const Tview = Ta[ch] / Math.max(Tb[ch], 1e-6);
+        out[ch] += Tview * Tsun[ch] * beta * dt;
+      }
+    }
+    return out;
+  }
+
+  // ---- Multi-scattering LUT：多次散射的辐亮度（各向同性近似 + 几何级数）----
+  function buildMultiScatteringLUT(P, transLUT) {
+    atmoHeightMapping(P);
+    const N = P.multiLutSize;
+    const Rb = P.bottomRadius;
+    const DIRS = 64;       // 球面上的方向数（Fibonacci 均匀分布）
+    const dirs = [];
+    const golden = 2.399963229728653;
+    for (let i = 0; i < DIRS; i++) {
+      const y = 1 - 2 * (i + 0.5) / DIRS;
+      const rr = Math.sqrt(Math.max(0, 1 - y * y));
+      const phi = i * golden;
+      dirs.push([rr * Math.cos(phi), y, rr * Math.sin(phi)]);
+    }
+    const f = Math.min(Math.max(P.multiScatteringFactor, 0), 0.95);
+    const geom = 1 / (1 - f);                       // 1 + f + f² + … ：无限次散射
+    const data = new Float32Array(N * N * 4);
+    for (let j = 0; j < N; j++) {
+      const r = atmoRadiusFromV((j + 0.5) / N, P);
+      for (let i = 0; i < N; i++) {
+        const mu = ((i + 0.5) / N) * 2 - 1;         // 太阳天顶角余弦（u 轴线性）
+        const s = Math.sqrt(Math.max(0, 1 - mu * mu));
+        const sun = [s, mu, 0];
+        let sr = 0, sg = 0, sb = 0;
+        for (let d = 0; d < DIRS; d++) {
+          const c = atmoIntegrateFirstOrder(r, dirs[d], sun, P, transLUT);
+          sr += c[0]; sg += c[1]; sb += c[2];
+        }
+        // 均匀方向求平均 = (1/4π)∫L₁dω；再乘几何级数得到多次散射总量
+        const k = (j * N + i) * 4;
+        data[k]     = sr / DIRS * geom;
+        data[k + 1] = sg / DIRS * geom;
+        data[k + 2] = sb / DIRS * geom;
+        data[k + 3] = 1;
+      }
+    }
+    return { data, width: N, height: N };
+  }
+
+  // Float32 → Float16（LUT 用半浮点：占 8 KB 且 WebGL2 原生支持线性过滤，
+  // 8 位定点在天空的平滑渐变上会出现明显色带）
+  const _f32 = new Float32Array(1);
+  const _i32 = new Int32Array(_f32.buffer);
+  function floatToHalf(v) {
+    _f32[0] = v;
+    const x = _i32[0];
+    const sign = (x >> 16) & 0x8000;
+    const e = (x >> 23) & 0xff;
+    let m = x & 0x7fffff;
+    if (e === 0xff) return sign | 0x7c00 | (m ? 0x200 : 0);
+    const exp = e - 127 + 15;
+    if (exp >= 0x1f) return sign | 0x7c00;
+    if (exp <= 0) {
+      if (exp < -10) return sign;
+      m |= 0x800000;
+      return sign | (m >> (14 - exp));
+    }
+    return sign | (exp << 10) | (m >> 13);
+  }
+  function atmoLutTextureUniform(lut) {
+    const half = new Uint16Array(lut.data.length);
+    for (let i = 0; i < lut.data.length; i++) half[i] = floatToHalf(lut.data[i]);
+    return new Cesium.TextureUniform({
+      typedArray: half,
+      width: lut.width,
+      height: lut.height,
+      pixelFormat: Cesium.PixelFormat.RGBA,
+      pixelDatatype: Cesium.PixelDatatype.HALF_FLOAT,
+      repeat: false,                                                 // CLAMP_TO_EDGE
+      minificationFilter: Cesium.TextureMinificationFilter.LINEAR,   // LUT 不加 mipmap
+      magnificationFilter: Cesium.TextureMagnificationFilter.LINEAR,
+    });
+  }
+
+  // 1×1 中性 LUT：createWater 未接大气时占位，保证 sampler uniform 始终有效
+  function atmoDummyLutUniform() {
+    return new Cesium.TextureUniform({
+      typedArray: new Uint16Array([0x3c00, 0x3c00, 0x3c00, 0x3c00]),   // half(1.0)
+      width: 1, height: 1,
+      pixelFormat: Cesium.PixelFormat.RGBA,
+      pixelDatatype: Cesium.PixelDatatype.HALF_FLOAT,
+      repeat: false,
+    });
+  }
+
+  // 天穹顶点着色器：几何体只负责"覆盖全屏"，位置不动
+  const SKY_VERTEX_SHADER = `
+void vertexMain(VertexInput vsInput, inout czm_modelVertexOutput vsOutput) {
+  // 天空盒的顶点位置不做任何修改：片元端用 positionEC 反推视线方向
+}
+`;
+  const SKY_FRAGMENT_SHADER = ATMOSPHERE_GLSL + `
+void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
+  // 相机在眼空间原点 ⇒ 视线方向就是片元位置的方向
+  vec3 rd = normalize(fsInput.attributes.positionEC);
+  vec3 sunDir = normalize(czm_sunDirectionEC);
+  float rCam = length(uAtmoCenterEC);
+  vec3  up0 = -uAtmoCenterEC / max(rCam, 1.0);
+  vec3 col = atmoSkyRadiance(rd, sunDir, rCam, dot(rd, up0),
+                             uAtmoSkySteps, uAtmoSunDiscScale);
+  material.diffuse = col;
+  material.alpha = 1.0;
+}
+`;
+
+  // 以地心为中心、包住整层大气的立方体（内表面朝向相机，故三角形绕序翻转）
+  function buildSkyBoxGlb(halfExtent) {
+    const h = halfExtent;
+    // 6 个面，每面 4 个顶点（POSITION + NORMAL + TEXCOORD_0）
+    const faces = [
+      [[+1, 0, 0], [[+h, -h, -h], [+h, -h, +h], [+h, +h, +h], [+h, +h, -h]]],
+      [[-1, 0, 0], [[-h, -h, +h], [-h, -h, -h], [-h, +h, -h], [-h, +h, +h]]],
+      [[0, +1, 0], [[-h, +h, -h], [+h, +h, -h], [+h, +h, +h], [-h, +h, +h]]],
+      [[0, -1, 0], [[-h, -h, +h], [+h, -h, +h], [+h, -h, -h], [-h, -h, -h]]],
+      [[0, 0, +1], [[-h, -h, +h], [-h, +h, +h], [+h, +h, +h], [+h, -h, +h]]],
+      [[0, 0, -1], [[+h, -h, -h], [+h, +h, -h], [-h, +h, -h], [-h, -h, -h]]],
+    ];
+    const positions = new Float32Array(24 * 3);
+    const normals = new Float32Array(24 * 3);
+    const uvs = new Float32Array(24 * 2);
+    const indices = new Uint16Array(36);
+    let vi = 0, ii = 0;
+    for (let f = 0; f < 6; f++) {
+      const n = faces[f][0], v = faces[f][1];
+      for (let k = 0; k < 4; k++) {
+        positions[vi * 3] = v[k][0]; positions[vi * 3 + 1] = v[k][1]; positions[vi * 3 + 2] = v[k][2];
+        normals[vi * 3] = n[0]; normals[vi * 3 + 1] = n[1]; normals[vi * 3 + 2] = n[2];
+        uvs[vi * 2] = (k === 1 || k === 2) ? 1 : 0;
+        uvs[vi * 2 + 1] = (k >= 2) ? 1 : 0;
+        vi++;
+      }
+      const b = f * 4;
+      // 绕序翻转：我们是从立方体【内部】看它的内表面
+      indices[ii++] = b;     indices[ii++] = b + 2; indices[ii++] = b + 1;
+      indices[ii++] = b;     indices[ii++] = b + 3; indices[ii++] = b + 2;
+    }
+
+    const posLen = positions.byteLength, nrmLen = normals.byteLength;
+    const uvLen = uvs.byteLength, idxLen = indices.byteLength;
+    const binLen = posLen + nrmLen + uvLen + idxLen;
+    const bin = new Uint8Array(binLen);
+    let o = 0;
+    bin.set(new Uint8Array(positions.buffer), o); o += posLen;
+    bin.set(new Uint8Array(normals.buffer), o); o += nrmLen;
+    bin.set(new Uint8Array(uvs.buffer), o); o += uvLen;
+    bin.set(new Uint8Array(indices.buffer), o); o += idxLen;
+
+    const json = {
+      asset: { version: '2.0', generator: 'ue5-water-material.js (sky)' },
+      scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
+      meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2 }, indices: 3, material: 0, mode: 4 }] }],
+      materials: [{ name: 'SkyDome', pbrMetallicRoughness: { baseColorFactor: [1, 1, 1, 1], metallicFactor: 0, roughnessFactor: 1 }, doubleSided: false }],
+      accessors: [
+        { bufferView: 0, componentType: 5126, count: 24, type: 'VEC3', min: [-h, -h, -h], max: [h, h, h] },
+        { bufferView: 1, componentType: 5126, count: 24, type: 'VEC3' },
+        { bufferView: 2, componentType: 5126, count: 24, type: 'VEC2' },
+        { bufferView: 3, componentType: 5123, count: 36, type: 'SCALAR' },
+      ],
+      bufferViews: [
+        { buffer: 0, byteOffset: 0, byteLength: posLen, target: 34962 },
+        { buffer: 0, byteOffset: posLen, byteLength: nrmLen, target: 34962 },
+        { buffer: 0, byteOffset: posLen + nrmLen, byteLength: uvLen, target: 34962 },
+        { buffer: 0, byteOffset: posLen + nrmLen + uvLen, byteLength: idxLen, target: 34963 },
+      ],
+      buffers: [{ byteLength: binLen }],
+    };
+
+    const jsonBytes = new TextEncoder().encode(JSON.stringify(json));
+    const jsonPad = (4 - (jsonBytes.length % 4)) % 4;
+    const binPad = (4 - (binLen % 4)) % 4;
+    const jsonChunkLen = jsonBytes.length + jsonPad;
+    const binChunkLen = binLen + binPad;
+    const total = 12 + 8 + jsonChunkLen + 8 + binChunkLen;
+    const glb = new ArrayBuffer(total);
+    const dv = new DataView(glb);
+    const u8 = new Uint8Array(glb);
+    let p = 0;
+    dv.setUint32(p, 0x46546c67, true); p += 4;
+    dv.setUint32(p, 2, true); p += 4;
+    dv.setUint32(p, total, true); p += 4;
+    dv.setUint32(p, jsonChunkLen, true); p += 4;
+    dv.setUint32(p, 0x4e4f534a, true); p += 4;
+    u8.set(jsonBytes, p); p += jsonBytes.length;
+    for (let i = 0; i < jsonPad; i++) u8[p++] = 0x20;
+    dv.setUint32(p, binChunkLen, true); p += 4;
+    dv.setUint32(p, 0x004e4942, true); p += 4;
+    u8.set(bin, p); p += binLen;
+    for (let i = 0; i < binPad; i++) u8[p++] = 0;
+    return glb;
+  }
+
+  // 把大气参数摊成 CustomShader 的 uniform 描述符（天穹与水面共享同一份对象，
+  // 于是 setUniform 一次两边一起变）
+  function atmoUniformSet(P, transLUT, multiLUT) {
+    const cart = function (a) { return new Cesium.Cartesian3(a[0], a[1], a[2]); };
+    return {
+      // LUT 传 null 时用 1×1 中性纹理占位 —— 水面未接大气时保证 sampler 有效
+      uAtmoTransLUT: { type: Cesium.UniformType.SAMPLER_2D, value: transLUT ? atmoLutTextureUniform(transLUT) : atmoDummyLutUniform() },
+      uAtmoMultiLUT: { type: Cesium.UniformType.SAMPLER_2D, value: multiLUT ? atmoLutTextureUniform(multiLUT) : atmoDummyLutUniform() },
+      uAtmoCenterEC: { type: Cesium.UniformType.VEC3, value: new Cesium.Cartesian3(0, 0, 0) },
+      uAtmoRayleigh: { type: Cesium.UniformType.VEC3, value: cart(P.rayleighScattering) },
+      uAtmoRayleighH: { type: Cesium.UniformType.FLOAT, value: P.rayleighScaleHeight },
+      uAtmoMieScatter: { type: Cesium.UniformType.FLOAT, value: P.mieScattering },
+      uAtmoMieAbsorb: { type: Cesium.UniformType.FLOAT, value: P.mieAbsorption },
+      uAtmoMieH: { type: Cesium.UniformType.FLOAT, value: P.mieScaleHeight },
+      uAtmoMieG: { type: Cesium.UniformType.FLOAT, value: P.miePhaseG },
+      uAtmoOzone: { type: Cesium.UniformType.VEC3, value: cart(P.ozoneAbsorption) },
+      uAtmoOzoneCenter: { type: Cesium.UniformType.FLOAT, value: P.ozoneCenterHeight },
+      uAtmoOzoneWidth: { type: Cesium.UniformType.FLOAT, value: P.ozoneWidth },
+      uAtmoBottomR: { type: Cesium.UniformType.FLOAT, value: P.bottomRadius },
+      uAtmoTopR: { type: Cesium.UniformType.FLOAT, value: P.topRadius },
+      uAtmoH0: { type: Cesium.UniformType.FLOAT, value: P.h0 },
+      uAtmoHScale: { type: Cesium.UniformType.FLOAT, value: P.hScale },
+      uAtmoMultiScale: { type: Cesium.UniformType.FLOAT, value: 1.0 },
+      uAtmoSunIrradiance: { type: Cesium.UniformType.FLOAT, value: P.sunIrradiance },
+      uAtmoExposure: { type: Cesium.UniformType.FLOAT, value: P.exposure },
+      uAtmoSunDiscCos: { type: Cesium.UniformType.FLOAT, value: Math.cos(P.sunAngularRadius) },
+      uAtmoSunDiscScale: { type: Cesium.UniformType.FLOAT, value: 12.0 },
+      uAtmoSkySteps: { type: Cesium.UniformType.FLOAT, value: P.skySteps },
+      uAtmoAPSteps: { type: Cesium.UniformType.FLOAT, value: P.apSteps },
+      uAtmoEnabled: { type: Cesium.UniformType.FLOAT, value: 1.0 },
+    };
+  }
+
+  // ==========================================================================
+  // createAtmosphere：生成 LUT + 天穹，并把 Cesium 自带大气/雾让位
+  //   options: { site:{lon,lat,height}, params:{...}, exposure, onStep }
+  // ==========================================================================
+  async function createAtmosphere(viewer, options) {
+    options = options || {};
+    const report = (typeof options.onStep === 'function') ? options.onStep : function () {};
+    const scene = viewer.scene;
+    const P = Object.assign({}, ATMOSPHERE_PRESET, options.params || {});
+
+    // 地面半径取 site 的【地心半径】：这样大气的地平线和场景里真实地平线贴合，
+    // 不会出现"大气地平线"与"地球剪影"错开一条缝的廉价感
+    const site = options.site || null;
+    if (site) {
+      const c = Cesium.Cartesian3.fromDegrees(site.lon, site.lat, site.height || 0);
+      P.bottomRadius = Cesium.Cartesian3.magnitude(c);
+    }
+    P.topRadius = P.bottomRadius + (options.atmosphereHeight || 100000);
+    if (options.exposure !== undefined) P.exposure = options.exposure;
+
+    report('生成大气 LUT（transmittance / multi-scattering）');
+    const t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const transLUT = buildTransmittanceLUT(P);
+    const multiLUT = buildMultiScatteringLUT(P, transLUT);
+    const t1 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const lutMs = Math.round(t1 - t0);
+
+    const uniforms = atmoUniformSet(P, transLUT, multiLUT);
+    const customShader = new Cesium.CustomShader({
+      lightingModel: Cesium.LightingModel.UNLIT,
+      uniforms: uniforms,
+      vertexShaderText: SKY_VERTEX_SHADER,
+      fragmentShaderText: SKY_FRAGMENT_SHADER,
+    });
+
+    report('生成天穹（glTF 立方体）');
+    const glb = buildSkyBoxGlb(P.topRadius);
+    const url = URL.createObjectURL(new Blob([glb], { type: 'model/gltf-binary' }));
+    const model = await Cesium.Model.fromGltfAsync({
+      url: url,
+      customShader: customShader,
+      backFaceCulling: false,     // 从立方体【内部】看内表面
+      allowPicking: false,
+      show: true,
+    });
+    scene.primitives.add(model);
+
+    // Cesium 自带天穹与物理大气是两套东西 —— 但【不能】简单关掉 skyAtmosphere：
+    // 动态雾（scene.fog）的雾色与天空大气联动，skyAtmosphere 一关雾色变黑，
+    // 远处的天穹会被"黑雾"整片吃掉（实测）。好在物理天穹是不透明几何，会把
+    // Cesium 的天空盖在下面，两者共存不冲突：它只负责给 globe 的雾供色。
+    const saved = {
+      skyAtmosphere: scene.skyAtmosphere ? scene.skyAtmosphere.show : false,
+      skyBox: scene.skyBox ? scene.skyBox.show : false,
+      fogEnabled: scene.fog ? scene.fog.enabled : false,
+    };
+    if (scene.skyBox) scene.skyBox.show = false;
+
+    const camera = viewer.camera;
+    const origin = new Cesium.Cartesian3(0, 0, 0);
+    const domeModelMatrix = new Cesium.Matrix4();
+    const removeTick = scene.preUpdate.addEventListener(function () {
+      if (!camera.viewMatrix) return;
+      // 地心在眼空间的位置 = 视图矩阵把世界原点变换过去（即视图矩阵的平移列）
+      Cesium.Matrix4.multiplyByPoint(camera.viewMatrix, origin, uniforms.uAtmoCenterEC.value);
+      // 【天穹跟随相机平移】两个目的：
+      //   1. 天空在光学上是"无穷远"，几何上跟着相机走才是正确语义（radiance 只由
+      //      视线方向 rd 决定，与天穹片元的绝对位置无关）；
+      //   2. 让天穹的包围球中心始终贴着相机 → Cesium 模型雾的判据
+      //      fog(distance(相机, 包围球中心)) = 0 → u_isInFog=false → 天穹不被
+      //      模型雾覆盖。若天穹定在地心（包围球中心恒距相机 6.37M），雾永远命中，
+      //      而雾色取"天穹顶点处的地面大气色"（在大气顶≈0）→ 整个天空被涂黑（实测）。
+      //      片元距离那一路也不用担心：u_isInFog=false 时 applyFog 整个跳过。
+      Cesium.Matrix4.setTranslation(Cesium.Matrix4.IDENTITY, camera.positionWC, domeModelMatrix);
+      model.modelMatrix = domeModelMatrix;
+    });
+
+    const subscribers = [];
+    const handle = {
+      uniforms: uniforms,          // 交给 createWater 复用（共享同一批描述符）
+      params: P,
+      model: model,
+      customShader: customShader,
+      lutMs: lutMs,
+      transLUT: transLUT,
+      multiLUT: multiLUT,
+      enabled: true,
+
+      /** 更新参数：写法与 createWater 一致（数值传 number，向量传数组） */
+      setUniform: function (key, value) {
+        const u = uniforms[key];
+        if (!u) return;
+        if (u.type === Cesium.UniformType.VEC3 && Array.isArray(value)) {
+          u.value = new Cesium.Cartesian3(value[0], value[1], value[2]);
+        } else {
+          u.value = value;
+        }
+        for (let i = 0; i < subscribers.length; i++) subscribers[i](key, u.value);
+      },
+
+      /** 让另一个 CustomShader（水面）跟随大气的 uniform 变化 */
+      subscribe: function (fn) { subscribers.push(fn); },
+
+      /** 整体开关：关掉天穹并让水面退回解析天空，便于 A/B */
+      setEnabled: function (on) {
+        handle.enabled = !!on;
+        model.show = handle.enabled;
+        uniforms.uAtmoEnabled.value = handle.enabled ? 1 : 0;
+        if (scene.skyBox) scene.skyBox.show = handle.enabled ? false : saved.skyBox;
+        for (let i = 0; i < subscribers.length; i++) subscribers[i]('uAtmoEnabled', uniforms.uAtmoEnabled.value);
+      },
+
+      destroy: function () {
+        if (removeTick) removeTick();
+        scene.primitives.remove(model);
+        URL.revokeObjectURL(url);
+        if (scene.skyBox) scene.skyBox.show = saved.skyBox;
+      },
+    };
+    return handle;
+  }
+
+  // ==========================================================================
   // 参数预置：写实海洋 / 湖泊
   //
   //  【铺贴尺度是怎么定的】uTiling* 是"整块 8000 m 面片上铺几遍"，于是
@@ -721,7 +1499,7 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       uWaveSpeedLow:      0.003,     // 129 m tile × 0.003 ≈ 0.39 m/s
       uWaveSpeedMid:      0.018,     //  40 m tile × 0.018 ≈ 0.72 m/s
       uWaveSpeedHigh:     0.088,     // 12.5 m tile × 0.088 ≈ 1.10 m/s
-      uSpecularIntensity: 1.6,
+      uSpecularIntensity: 1.1,
       uFoamThreshold:     0.55,
       uFoamColor:         '#eef7f5',
 
@@ -750,7 +1528,10 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
 
       // ---- 高光 / 泡沫 / 通透度 ----
       uSpecularPower:     1200,
-      uSpecularPowerFar:  90,        // 远处高光瓣展宽（高光 LOD）
+      // 【v18 灰斑修复】远处高光瓣 90 → 260：90 太宽，远场光路被抹成一片平滑乳白
+      // （远处法线被 mipmap 平均后 NdH 无起伏，宽瓣 = 整片同时命中 ⇒ 蓝色被白稀释成灰带）。
+      // 260 仍比近场的 1200 宽 4.6 倍，保住"远处高光能打中波面"的本意，但光路收成闪鳞柱。
+      uSpecularPowerFar:  260,       // 远处高光瓣展宽（高光 LOD）
       uSpecularAniso:     0.60,
       uFoamSharpness:     0.22,
       uAlpha:             0.98,
@@ -771,17 +1552,33 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       uHazeDensity:       2.5e-5,
 
       // ---- 解析天空 ----
-      uSkyColor:          '#2f6092', // 天顶色（只影响水里的反射）：够暗才显得水深
-      uHorizonColor:      '#a9c6d8',
-      uHorizonHaze:       '#dfeef2',
-      uHorizonHazeStrength: 0.30,
-      uSkyGradientPow:    0.55,
+      // 【v17 用户选定配色 A"亮蓝"】四套候选（亮蓝/深宝蓝/晴日青蓝/暗深蓝）渲染对比后用户挑的这套。
+      uSkyColor:          '#4a86b8', // 天顶色（只影响水里的反射）
+      // 【地平线色决定掠射角的"灰/黑"】远场 fresnel 0.6~0.9 ⇒ 远场水色 ≈ 反射的地平线色本身。
+      //   v15：#8fb6d0（HSV 饱和 31）→ 远场淡灰蓝（用户："大片灰色"）；
+      //   v16：#5590c2（sat 56 但偏暗）→ 又踩了 pow 的坑，远场 lum 只有 110（用户："灰黑色"）；
+      //   v17：#6db2e0（sat 46、亮度 68）+ pow 0.85 → 远场 rgb(93,143,178) lum 132，亮而蓝。
+      // 【uSkyGradientPow 的方向千万别搞反】skyT∈[0,1]，指数越小 pow 值越大 ⇒
+      //   越快混向暗天顶色 ⇒ 越暗。0.55→0.45（v15）实际是在"加速变暗"。
+      uHorizonColor:      '#6db2e0',
+      // 雾带同理：暖白会把掠射反射染成"脏灰"，转冷并降强度。
+      // 【雾带恰好叠在远场】strength 大了会把刚调好的地平线色冲淡回灰。
+      uHorizonHaze:       '#cfe2f0',
+      uHorizonHazeStrength: 0.12,
+      uSkyGradientPow:    0.85,
       uSkyForwardScatter: 0.45,      // 太阳附近的宽角前向散射（让反光有方向）
-      uBelowHorizonDark:  0.70,      // 反射落到地平线以下时混入"远海色"的比例（远场明暗波带的来源）
+      // 【v19 用户实测发现并采纳】0.70 → 0.35：低机位掠射时大量波面的反射方向落到
+      // 地平线以下，会被 mix 进"远海色"；0.70 时这些面片接近黑色 → 成片暗斑驳（"灰斑"）。
+      // 配合 farSea 提亮（见着色器 §5），0.35 既消斑又保留部分远场明暗波带。
+      // 面板上可继续微调：再小更干净但波带变平，再大波带明显但暗斑回来。
+      uBelowHorizonDark:  0.35,      // 反射落到地平线以下时混入"远海色"的比例（远场明暗波带的来源）
       uSunColor:          '#fff2d8',
       uSunDiscCos:        0.99960,
       uSunDiscIntensity:  3.0,
-      uSunGlowIntensity:  0.45,
+      // 【v18 灰斑修复】0.45 → 0.22：辉光是太阳光路白色冲刷的第二大来源
+      // （A/B 实测：关掉它光路列灰比 8.8%→6.1%）。减半后光路仍是金色亮带，但不再把
+      // 周围一大片水冲成灰白。
+      uSunGlowIntensity:  0.22,
       uSunGlowPow:        260,
     },
     lake: {
@@ -836,7 +1633,9 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       uHorizonHazeStrength: 0.42,
       uSkyGradientPow:    0.62,
       uSkyForwardScatter: 0.40,
-      uBelowHorizonDark:  0.55,
+      // 【v20】与海洋同步：0.55 → 0.35。湖泊同样会在掠射时把大量波面反射到地平线下，
+      // 0.55 配合（已提亮的）farSea 仍偏暗；降到 0.35 消暗斑驳，湖面更均匀。
+      uBelowHorizonDark:  0.35,
       uSunColor:          '#fff6e2',
       uSunDiscCos:        0.99960,
       uSunDiscIntensity:  2.2,
@@ -1207,14 +2006,10 @@ void main(void)
     const normal3 = makeWaterNormalUniform(normalTexSize, NORMAL_LAYERS[3]);
 
     report('构建 CustomShader');
-    const customShader = new Cesium.CustomShader({
-      lightingModel: Cesium.LightingModel.UNLIT,   // 光照全部自算，走 UNLIT 最省
-      varyings: {
-        v_nTbn:  Cesium.VaryingType.VEC3,          // 波面法线（TBN 坐标系）
-        v_crest: Cesium.VaryingType.FLOAT,         // 归一化波峰高度（泡沫用）
-      },
-      uniforms: {
-        // ---- 动画时间（由 createWater 每帧写入）----
+    // uniforms 先建成独立对象：大气接入必须在 CustomShader 构造【之前】完成 ——
+    // Cesium 的 uniformMap 在构造时按 key 闭包绑定，事后加 key 不会生效。
+    const waterUniforms = {
+      // ---- 动画时间（由 createWater 每帧写入）----
         //  uTime      : 秒。默认来自墙钟（performance.now），因此不受帧率影响。
         //  uTimeScale : 全局速度倍率。0 = 完全静止（出静帧/截图），2 = 两倍速。
         //              它同时缩放【顶点 Gerstner 相位】和【四层法线贴图的滚动】，
@@ -1292,7 +2087,28 @@ void main(void)
         uSunDiscIntensity:    { type: Cesium.UniformType.FLOAT, value: state.uSunDiscIntensity },
         uSunGlowIntensity:    { type: Cesium.UniformType.FLOAT, value: state.uSunGlowIntensity },
         uSunGlowPow:          { type: Cesium.UniformType.FLOAT, value: state.uSunGlowPow },
+    };
+
+    // ---- Frostbite 大气 uniforms ----
+    // 水面 shader 已包含 ATMOSPHERE_GLSL（uAtmo* 声明），这批 uniform 必须存在：
+    //   · options.atmosphere 缺省：1×1 中性 LUT + uAtmoEnabled=0 → 走解析天空分支；
+    //   · 接入 createAtmosphere 的句柄：与天穹【共享同一批描述符对象】——
+    //     createAtmosphere 每帧只更新一次 uAtmoCenterEC，天穹与水面同时生效，
+    //     水天色调严格一致（反射/气透视/水下斯涅尔窗三处共用）。
+    const atmoDefaults = Object.assign({}, ATMOSPHERE_PRESET, { bottomRadius: 6368000, topRadius: 6468000 });
+    atmoHeightMapping(atmoDefaults);
+    const atmoFallback = atmoUniformSet(atmoDefaults, null, null);
+    atmoFallback.uAtmoEnabled.value = 0;
+    const sharedAtmo = (options.atmosphere && options.atmosphere.uniforms) ? options.atmosphere.uniforms : null;
+    Object.assign(waterUniforms, sharedAtmo || atmoFallback);
+
+    const customShader = new Cesium.CustomShader({
+      lightingModel: Cesium.LightingModel.UNLIT,   // 光照全部自算，走 UNLIT 最省
+      varyings: {
+        v_nTbn:  Cesium.VaryingType.VEC3,          // 波面法线（TBN 坐标系）
+        v_crest: Cesium.VaryingType.FLOAT,         // 归一化波峰高度（泡沫用）
       },
+      uniforms: waterUniforms,
       vertexShaderText: VERTEX_SHADER,
       fragmentShaderText: FRAGMENT_SHADER,
     });
@@ -1349,6 +2165,7 @@ void main(void)
       state: state,
       center: center,
       site: site,                    // { lon, lat, height }：水面高度即 site.height
+      atmosphere: options.atmosphere || null,   // 接入的大气句柄（调试/A-B 用）
       surfaceHeight: site.height,
       url: url,
       segmentCount: segments,
@@ -1390,14 +2207,21 @@ void main(void)
   global.Ue5Water = {
     VERTEX_SHADER: VERTEX_SHADER,
     FRAGMENT_SHADER: FRAGMENT_SHADER,
+    ATMOSPHERE_GLSL: ATMOSPHERE_GLSL,
+    ATMOSPHERE_PRESET: ATMOSPHERE_PRESET,
     PRESETS: PRESETS,
     NORMAL_LAYERS: NORMAL_LAYERS,
     buildPlaneGlb: buildPlaneGlb,
+    buildSkyBoxGlb: buildSkyBoxGlb,
     makeTileableHeightField: makeTileableHeightField,
     heightFieldToNormalData: heightFieldToNormalData,
     makeWaterNormalUniform: makeWaterNormalUniform,
     hexToLinear: hexToLinear,
+    buildTransmittanceLUT: buildTransmittanceLUT,
+    buildMultiScatteringLUT: buildMultiScatteringLUT,
+    atmoSampleTransmittanceRGB: atmoSampleTransmittanceRGB,
     createWater: createWater,
+    createAtmosphere: createAtmosphere,
     createUnderwater: createUnderwater,
   };
 })(typeof window !== 'undefined' ? window : globalThis);
