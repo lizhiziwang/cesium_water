@@ -186,6 +186,12 @@ void vertexMain(VertexInput vsInput, inout czm_modelVertexOutput vsOutput) {
 //   uAtmoSunDiscCos / uAtmoSunDiscScale    太阳盘（cos 角半径 / 强度）
 //   uAtmoSkySteps / uAtmoAPSteps   天空 / 气透视步进数
 //   uAtmoEnabled                   0 = 水面退回解析天空（A/B 用）
+//
+// 以下两个【不是大气参数，而是水面侧的合成控制】（只在本文件的片元着色器里用，
+// 天穹不读；默认值见 PRESETS 的 uAtmoApScale / uAtmoReflGain）：
+//   uAtmoApScale    气透视强度 0..1（1 = 标准 color·T+S，0 = 关闭）
+//   uAtmoReflGain   物理天空反射强度（1 = 完全按物理；<1 压暗，见 §5 注释）
+//   uAtmoReflTint   地平线附近反射的色相校正（向 uHorizonColor 靠，见 §5 注释）
 
 const float ATMO_PI = 3.141592653589793;
 const int   ATMO_SKY_MAX = 64;        // 循环上限必须是常量（GLSL ES 约束）
@@ -484,8 +490,25 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
     // 反射里不出太阳盘：太阳亮路由下面的 spec/sunGlow 专管，两套太阳会穿帮。
     // 步数封顶 20：反射是"第二跳"光线，天穹那份精度在水面里看不出差别
     // （数值验证 20/32/64 步差异 <4%）。
-    reflCol = atmoSkyRadiance(rdSky, L, rCamA, dot(rdSky, up0A), min(uAtmoSkySteps, 20.0), 0.0);
-    reflCol = mix(reflCol, farSea, belowT * uBelowHorizonDark);
+    // 【uAtmoReflGain / uAtmoReflTint：物理天空反射的强度与色相校正】
+    // 低太阳高度角下地平线天空在物理上是【暖白】的：太阳光斜穿大气被红光化，
+    // 数值实测（el=11°）地平线 B-R = -0.05（暖）、朝太阳方向 (0.91,0.87,0.76)，
+    // 天顶才是蓝的 —— 这是物理正确的结果。但掠射水面 fresnel 0.6~0.9 ⇒ 水色几乎
+    // 等于这层暖白天空，中远景整片成灰白板：
+    //   中远景水面实测  物理 (0.739,0.754,0.727)【近无彩色】 vs 旧解析天空 (0.489,0.638,0.724)【蓝】
+    //   —— 亮度接近，差的是色度（B-R：0.00 vs 0.24）。而【对无彩色做饱和度提升无效】
+    //   （R≈G≈B 时围绕亮度缩放仍是同一个值），只能乘一个色相。
+    // 这里把面板上已有的 uHorizonColor（用户选定的地平线蓝）归一化到亮度 1 当滤镜：
+    //   只改色相、不改明暗，且【只在地平线附近生效】—— 仰角升高后物理天空本来就是蓝的，
+    //   不做干预（保持物理）。1.0 = 完全不干预（纯物理）。
+    float elevSky = dot(rdSky, up0A);
+    reflCol = atmoSkyRadiance(rdSky, L, rCamA, elevSky, min(uAtmoSkySteps, 20.0), 0.0);
+    vec3  tintHC  = uHorizonColor / max(dot(uHorizonColor, vec3(0.2126, 0.7152, 0.0722)), 1e-4);
+    reflCol *= mix(vec3(1.0), tintHC, uAtmoReflTint * (1.0 - smoothstep(0.02, 0.30, elevSky)));
+    // uAtmoReflGain：真实海面的粗糙微坡（几何遮蔽）会让掠射的实际反射率低于理想
+    // Fresnel，且远处的海始终比它上方的天空【暗一截】。乘 <1 的增益同时得到这两点。
+    reflCol *= uAtmoReflGain;
+    reflCol  = mix(reflCol, farSea, belowT * uBelowHorizonDark);
   } else {
     // ---- 解析天空（uAtmoEnabled=0 时退回）----
     // 天顶 -> 地平线 渐变，再压一层地平线雾带，形成那条典型的亮边
@@ -567,7 +590,14 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
     // 水色是手调的显示空间颜色，这个组合正是把"水面"压进"大气"的标准近似。
     vec3 apT, apS;
     atmoAerialPerspective(normalize(posEC), viewDist, L, apT, apS);
-    color = color * apT + apS;
+    // 【uAtmoApScale：气透视强度 —— 用户反馈"大片灰白"的第一来源】
+    // 全强度 AP 在这个场景里比旧解析雾强 20~50 倍（数值：3 km 处 apS=(0.305,0.264,0.229)
+    // 而旧解析雾只有 0.56%；8 km apS≈0.53、旧雾 3.9%），且 apS 是【中性偏暖】的
+    // （多次散射各向同性 + 低太阳的米氏），叠在深青水色上 ⇒ 中远景整片灰白。
+    // 实测合成：3 km 水色从 (0.01,0.12,0.15) 被拉到 (0.31,0.37,0.37) —— 55% 中灰。
+    // 用 mix 而不是直接缩放：uAtmoApScale=1 仍是标准合成式 color·T+S（物理），
+    // =0 完全关闭，中间值线性插值，单调、可预期。
+    color = mix(color, color * apT + apS, clamp(uAtmoApScale, 0.0, 1.0));
   } else {
     // 解析雾：与 czm_fog 相同的二次型 1 - exp(-(d·ρ)²)，密度可调以便对齐不同底图
     float hazeT = 1.0 - exp(-pow(viewDist * uHazeDensity, 2.0));
@@ -1585,6 +1615,12 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       // 配合 farSea 提亮（见着色器 §5），0.35 既消斑又保留部分远场明暗波带。
       // 面板上可继续微调：再小更干净但波带变平，再大波带明显但暗斑回来。
       uBelowHorizonDark:  0.35,      // 反射落到地平线以下时混入"远海色"的比例（远场明暗波带的来源）
+      // ---- 物理大气下的水面合成控制（详见着色器 §5 / §9.5 注释）----
+      // 低太阳高度角时物理天空的地平线本身就是暖白（B-R≈-0.05），全强度反射 +
+      // 全强度气透视会让中远景水面变成灰白板（用户实测反馈）。
+      uAtmoReflGain:      0.75,      // 物理天空反射强度（1 = 完全按物理，<1 压暗并露回水色）
+      uAtmoReflTint:      0.75,      // 地平线附近反射色相校正（向 uHorizonColor 靠，1 = 全用 uHorizonColor）
+      uAtmoApScale:       0.45,      // 气透视强度（1 = 标准 color·T+S，0 = 关闭）
       uSunColor:          '#fff2d8',
       uSunDiscCos:        0.99960,
       uSunDiscIntensity:  3.0,
@@ -1649,6 +1685,10 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
       // 【v20】与海洋同步：0.55 → 0.35。湖泊同样会在掠射时把大量波面反射到地平线下，
       // 0.55 配合（已提亮的）farSea 仍偏暗；降到 0.35 消暗斑驳，湖面更均匀。
       uBelowHorizonDark:  0.35,
+      // ---- 物理大气下的水面合成控制（海洋同步；湖面体色更亮，反射压得稍轻）----
+      uAtmoReflGain:      0.78,
+      uAtmoReflTint:      0.70,
+      uAtmoApScale:       0.45,
       uSunColor:          '#fff6e2',
       uSunDiscCos:        0.99960,
       uSunDiscIntensity:  2.2,
@@ -2095,6 +2135,10 @@ void main(void)
         uSkyGradientPow:      { type: Cesium.UniformType.FLOAT, value: state.uSkyGradientPow },
         uSkyForwardScatter:   { type: Cesium.UniformType.FLOAT, value: state.uSkyForwardScatter },
         uBelowHorizonDark:    { type: Cesium.UniformType.FLOAT, value: state.uBelowHorizonDark },
+        // 物理大气下的水面合成控制（水面专属，天穹不读）
+        uAtmoReflGain:        { type: Cesium.UniformType.FLOAT, value: (state.uAtmoReflGain === undefined) ? 1.0 : state.uAtmoReflGain },
+        uAtmoReflTint:        { type: Cesium.UniformType.FLOAT, value: (state.uAtmoReflTint === undefined) ? 0.0 : state.uAtmoReflTint },
+        uAtmoApScale:         { type: Cesium.UniformType.FLOAT, value: (state.uAtmoApScale === undefined) ? 1.0 : state.uAtmoApScale },
         uSunColor:            { type: Cesium.UniformType.VEC3,  value: hexToLinear(state.uSunColor) },
         uSunDiscCos:          { type: Cesium.UniformType.FLOAT, value: state.uSunDiscCos },
         uSunDiscIntensity:    { type: Cesium.UniformType.FLOAT, value: state.uSunDiscIntensity },

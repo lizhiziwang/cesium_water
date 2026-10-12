@@ -25,6 +25,10 @@
 | --- | --- |
 | ![](screenshots/08-frostbite-sky.png) | ![](screenshots/09-frostbite-under.png) |
 
+| Frostbite 大气 · 低太阳掠射水面（无灰白板） |
+| --- |
+| ![](screenshots/10-atmo-grayfix-ocean.png) |
+
 ## 快速开始
 
 **看效果** —— 直接双击 `index.html`（全部代码内联，仅需联网加载 Cesium CDN）。
@@ -69,6 +73,8 @@ underwater.setUnderwater(true);           // 入水（setUnderwater(false) 出�
 - **参数面板（HUD）**：预设切换、太阳时刻、相机机位、全部 uniform 滑杆，右上角可折叠。
 - **物理大气**：面板「Frostbite 物理大气」勾选框 = `setEnabled` 开关（A/B 对比），
   「大气曝光」滑杆 = `uAtmoExposure`。太阳时刻滑杆同时驱动物理大气的太阳方向。
+  「物理大气 · 水面合成」一组的三个滑杆 = `uAtmoReflTint` / `uAtmoReflGain` / `uAtmoApScale`
+  （解决低太阳掠射时中远景水面发灰白，见下文「常用参数速查」）。
 - **底图**：公开影像服务（Esri 卫星 / OSM），**无需 Cesium ion token**；底图加载失败不影响水面。
 - **波浪速度**：面板「运动速度」滑杆就是 `uTimeScale`，另有「暂停波浪」按钮。
 
@@ -87,6 +93,18 @@ underwater.setUnderwater(true);           // 入水（setUnderwater(false) 出�
 | `uAlpha` | 整体通透度 |
 | `uEdgeFade` | 面片边缘羽化，让水面溶进下方真实影像 |
 | `uAtmoExposure` | 物理大气曝光（天穹 + 水面反射 + 气透视同步生效） |
+| `uAtmoReflGain` | **物理天空反射强度**（1 = 完全按物理；<1 压暗，让水色透出来） |
+| `uAtmoReflTint` | **地平线反射色相校正**（向 `uHorizonColor` 靠，1 = 完全用它） |
+| `uAtmoApScale` | **气透视强度**（1 = 标准 `color·T+S`，0 = 关闭） |
+
+后三项只影响**水面**（天穹不读），默认值已按"低太阳 + 掠射"调好。物理大气在低太阳
+高度角下，地平线天空本身就是**暖白**的（太阳光斜穿大气被红光化，数值实测 B-R≈-0.05），
+而掠射水面 fresnel 0.6~0.9 ⇒ 水色几乎等于这层暖白天空；再加上物理气透视比旧解析雾强
+20~50 倍（3 km 处入散射 0.27 vs 旧雾 0.56%），中远景水面会糊成一片**灰白板**。
+`uAtmoReflTint` 用已有的 `uHorizonColor` 归一化到亮度 1 当色相滤镜（只改色相不改明暗，
+且只在地平线附近生效），把反射拉回"海面该有的蓝"；`uAtmoReflGain` 把海压到天空之下
+（远处的海始终比它上方的天空暗一截）；`uAtmoApScale` 把过强的气透视压回合理量。
+三项都设 1 就是"完全按物理"的观感。
 
 **波浪速度分两层**：`uGerstnerSpeed` 控制顶点浪的相速度，`uWaveSpeedLow/Mid/High`
 控制法线纹理滚动；"整体快慢"只用动 `uTimeScale` 一个旋钮。
@@ -149,4 +167,6 @@ Cesium（WebGL / 前向渲染 / 单 Pass 模型）拿不到屏幕深度与场景
 | 卡在「检查运行环境」 | 浏览器不支持 WebGL2：换新版 Chrome / Edge，检查 `chrome://gpu` |
 | 着色器编译报错（顶部红条） | 看控制台 `[step ✘]` 行；先跑 `node _verify_glb.cjs` 静态排查 |
 | 天空全黑 / 天穹被雾盖住 | 确认未手动改 `scene.fog`；天穹依赖"包围球跟随相机"避开模型雾（createAtmosphere 内部处理） |
+| 中远景水面成片**灰白**（低太阳 + 掠射） | 物理天空的地平线本身是暖白、且气透视比旧解析雾强 20~50 倍。调 `uAtmoReflTint`（↑ 更蓝）、`uAtmoReflGain`（↓ 更暗更透水色）、`uAtmoApScale`（↓ 雾更薄）；三项都设 1 即完全按物理 |
+| 背光波面发黑 | 反射方向落到地平线以下时物理积分的射线打到地面且地表辐射为 0。着色器已把反射射线钳到地平线再采样（§5），若仍见暗斑先确认 `uBelowHorizonDark` 未被调得过大 |
 | 底图不显示 | 不影响水面；Esri/OSM 瓦片服务偶尔限流，稍后重试或切底图 |
