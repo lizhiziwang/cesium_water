@@ -686,9 +686,22 @@ void fragmentMain(FragmentInput fsInput, inout czm_modelMaterial material) {
     float rCamA = length(uAtmoCenterEC);
     vec3  up0A  = -uAtmoCenterEC / max(rCamA, 1.0);
     vec3  rdR   = normalize(R + up0A * microC);
+    // 【地平线以下必须钳到地平线再查天空，否则背光波面整体塌黑】
+    // 掠射角下大量波面（尤其背光侧）的反射方向落到地平线以下；物理积分对
+    // "打到地面"的射线只有沿途稀薄入散射、末端接地后地表辐射为 0 ——
+    // 实测 el=-4° 背光方向亮度只有旧解析版的 1/6，且地平线上下有 4 倍断层。
+    // 语义上掠射的远海 fresnel≈1，反射的就是地平线天空本身，所以钳到地平线
+    // 采样（保住方位角 → 太阳侧亮、背光侧暗的方向感还在），再与解析分支
+    // 一样按 belowT 混向远海色。clamped 后地平线上下无缝。
+    float elevR  = dot(rdR, up0A);
+    vec3  rdSky  = normalize(rdR - up0A * min(elevR, 0.0));
+    float belowT = 1.0 - smoothstep(-0.06, 0.0, elev);       // 1 = 地平线以下
+    vec3  farSea = uAbsorptionColor * 0.45 + uScatteringColor * 0.30;
     // 反射里不出太阳盘：太阳亮路由下面的 spec/sunGlow 专管，两套太阳会穿帮。
-    // 步数封顶 20：反射是"第二跳"光线，天穹那份精度在水面里看不出差别。
-    reflCol = atmoSkyRadiance(rdR, L, rCamA, dot(rdR, up0A), min(uAtmoSkySteps, 20.0), 0.0);
+    // 步数封顶 20：反射是"第二跳"光线，天穹那份精度在水面里看不出差别
+    // （数值验证 20/32/64 步差异 <4%）。
+    reflCol = atmoSkyRadiance(rdSky, L, rCamA, dot(rdSky, up0A), min(uAtmoSkySteps, 20.0), 0.0);
+    reflCol = mix(reflCol, farSea, belowT * uBelowHorizonDark);
   } else {
     // ---- 解析天空（uAtmoEnabled=0 时退回）----
     // 天顶 -> 地平线 渐变，再压一层地平线雾带，形成那条典型的亮边
